@@ -21,6 +21,7 @@
 #include <memory>
 #include <thread>
 #include <random>
+#include <utility>
 
 namespace rtp_llm {
 
@@ -209,6 +210,17 @@ MtpExecutor::MtpExecutor(const EngineInitParams&                        params,
     LogitsProcessorFactory::init(params.model_config_.ckpt_path, params.sp_config.tree_decode_config);
 
     for (auto& mtp_params : *propose_params->mtp_model_params_) {
+        // Extract Eagle3 d2t/t2d buffers before creating the model (move semantics
+        // inside GptModelInitParams may invalidate the reference otherwise).
+        eagle3_d2t_ = mtp_params->gpt_weights.eagle3_d2t;
+        eagle3_t2d_ = mtp_params->gpt_weights.eagle3_t2d;
+        if (eagle3_d2t_) {
+            RTP_LLM_LOG_INFO("[Eagle3] d2t table loaded: %zu draft tokens -> target vocab", eagle3_d2t_->shape()[0]);
+        }
+        if (eagle3_t2d_) {
+            RTP_LLM_LOG_INFO("[Eagle3] t2d table loaded: %zu target tokens mapped", eagle3_t2d_->shape()[0]);
+        }
+
         auto model_params =
             GptModelInitParams({device_,
                                 mtp_params->gpt_weights,
@@ -377,12 +389,15 @@ absl::Status MtpExecutor::prefillStep(const std::list<GenerateStreamPtr>& stream
         return absl::OkStatus();
     }
 
-    // draft model sample
+    // draft model sample (prefill)
     {
         RTP_LLM_PROFILE_SCOPE("executor.mtp.prefill_step(draft_model_sample)");
-        fast_topk_sampler_output = fast_topk_sampler_->forward(Buffer2torchTensor(*draft_model_output.logits, false));
-        draft_sampler_output.all_probs = torchTensor2Buffer(fast_topk_sampler_output.all_probs);
-        draft_sampler_output.token_ids = torchTensor2Buffer(fast_topk_sampler_output.token_ids);
+        auto fast_topk_sampler_output =
+            fast_topk_sampler_->forward(Buffer2torchTensor(*draft_model_output.logits, false));
+        auto [mapped_probs, mapped_ids] =
+            mapDraftToTarget(fast_topk_sampler_output.all_probs, fast_topk_sampler_output.token_ids);
+        draft_sampler_output.all_probs = torchTensor2Buffer(mapped_probs);
+        draft_sampler_output.token_ids = torchTensor2Buffer(mapped_ids);
     }
 
     // collect metrics
@@ -657,13 +672,15 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
         return absl::OkStatus();
     }
 
-    // draft model sample
+    // draft model sample (post-verify prefill) – remap to target vocab if needed
     {
         RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(draft_model_sample)");
-        fast_topk_sampler_output =
+        auto fast_topk_sampler_output =
             fast_topk_sampler_->forward(Buffer2torchTensor(*draft_prefill_model_output.logits, false));
-        draft_prefill_sampler_output.all_probs = torchTensor2Buffer(fast_topk_sampler_output.all_probs);
-        draft_prefill_sampler_output.token_ids = torchTensor2Buffer(fast_topk_sampler_output.token_ids);
+        auto [mapped_probs, mapped_ids] =
+            mapDraftToTarget(fast_topk_sampler_output.all_probs, fast_topk_sampler_output.token_ids);
+        draft_prefill_sampler_output.all_probs = torchTensor2Buffer(mapped_probs);
+        draft_prefill_sampler_output.token_ids = torchTensor2Buffer(mapped_ids);
     }
 
     // collect metrics
@@ -833,19 +850,23 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
         RTP_LLM_LOG_DEBUG("draft model decode step %d batch_size %d", i, batch_size);
         draft_decode_model_output = std::move(draft_model_->forward(model_input));
 
-        // sample
+        // sample and remap draft vocab → target vocab if eagle3_d2t_ is available
         auto fast_topk_sampler_output =
             fast_topk_sampler_->forward(Buffer2torchTensor(*draft_decode_model_output.logits, false), 1);
-        auto draft_probs         = fast_topk_sampler_output.all_probs;
-        auto draft_probs_reshape = draft_probs.reshape({(int)batch_size, 1, -1});
-        auto draft_token_ids     = fast_topk_sampler_output.token_ids;
+        auto draft_token_ids = fast_topk_sampler_output.token_ids;
+        auto draft_probs     = fast_topk_sampler_output.all_probs;
 
         if (model_input.is_fake_stream) {
             draft_token_ids.zero_();
             device_->bufMemset(*draft_decode_model_output.all_hidden_states, 0);
         }
 
-        draft_token_ids = draft_token_ids.to(torch::kInt32);
+        // Apply d2t: convert token IDs and expand probs to target vocab space.
+        auto [mapped_probs, mapped_ids] = mapDraftToTarget(draft_probs, draft_token_ids);
+        draft_token_ids                 = mapped_ids.to(torch::kInt32);
+        // Reshape probs to [batch, 1, vocab] for later cat.
+        auto draft_probs_reshape = mapped_probs.reshape({(int)batch_size, 1, -1});
+
         draft_token_ids_list.push_back(draft_token_ids);
         draft_probs_list.push_back(draft_probs_reshape);
 
@@ -888,6 +909,47 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
         const auto& cache_cfg             = cache_manager_->cacheConfig();
         model_input.kv_block_stride_bytes = cache_cfg.kv_block_stride_bytes;
     }
+}
+
+std::pair<torch::Tensor, torch::Tensor> MtpExecutor::mapDraftToTarget(const torch::Tensor& draft_all_probs,
+                                                                      const torch::Tensor& draft_token_ids) const {
+    if (!eagle3_d2t_) {
+        return {draft_all_probs, draft_token_ids};
+    }
+
+    // d2t lookup table: [draft_vocab_size] int32, on device.
+    // We need int64 indices for torch gather/scatter/index_select.
+    auto d2t_t = Buffer2torchTensor(*eagle3_d2t_, false).to(torch::kInt64);  // [D]
+
+    // ── Map token IDs: draft vocab → target vocab ────────────────────────
+    auto orig_ids_shape = draft_token_ids.sizes().vec();
+    auto flat_ids       = draft_token_ids.to(torch::kInt64).flatten();  // [N]
+    auto target_ids     = d2t_t
+                          .index_select(0, flat_ids)  // [N]
+                          .reshape(orig_ids_shape)
+                          .to(torch::kInt32);
+
+    // ── Expand probabilities: [..., draft_vocab] → [..., target_vocab] ──
+    // Build the index tensor by broadcasting d2t across the batch dims.
+    auto    probs_shape  = draft_all_probs.sizes().vec();  // e.g. [batch, draft_vocab]
+    int64_t draft_vocab  = probs_shape.back();
+    auto    target_shape = probs_shape;
+    target_shape.back()  = static_cast<int64_t>(vocab_size_);
+
+    // idx: same shape as draft_all_probs, each row = d2t indices
+    std::vector<int64_t> expand_shape(probs_shape.size(), 1);
+    expand_shape.back() = draft_vocab;
+    auto d2t_row        = d2t_t.reshape(expand_shape).expand(probs_shape);  // [..., draft_vocab]
+
+    auto expanded_probs = torch::zeros(target_shape, draft_all_probs.options());
+    expanded_probs.scatter_(-1, d2t_row, draft_all_probs);
+
+    RTP_LLM_LOG_DEBUG("[Eagle3 d2t] mapped %ld draft tokens, probs [%s] -> [%s]",
+                      flat_ids.size(0),
+                      torch::str(draft_all_probs.sizes()).c_str(),
+                      torch::str(expanded_probs.sizes()).c_str());
+
+    return {expanded_probs, target_ids};
 }
 
 }  // namespace rtp_llm

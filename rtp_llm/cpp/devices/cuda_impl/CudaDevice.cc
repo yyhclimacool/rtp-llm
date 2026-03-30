@@ -373,8 +373,12 @@ DeviceProperties CudaDevice::getDeviceProperties() {
         prop->use_deepep_low_latency   = init_params_.use_deepep_low_latency;
         prop->is_mtp                   = init_params_.is_mtp;
         prop->is_eagle3                = init_params_.is_eagle3;
-        prop->ffn_as_service           = init_params_.ffn_as_service;
-        prop->enable_prefill_cp        = init_params_.enable_prefill_cp;
+        if (!init_params_.eagle3_selected_layer_ids.empty()) {
+            prop->eagle3_selected_layer = std::set<int>(init_params_.eagle3_selected_layer_ids.begin(),
+                                                        init_params_.eagle3_selected_layer_ids.end());
+        }
+        prop->ffn_as_service    = init_params_.ffn_as_service;
+        prop->enable_prefill_cp = init_params_.enable_prefill_cp;
     }
     return *prop;
 }

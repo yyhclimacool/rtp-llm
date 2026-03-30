@@ -152,6 +152,14 @@ struct Weights {
     std::shared_ptr<const LayerNormWeights> final_layernorm;
     std::shared_ptr<const DenseWeights>     linear_bias_slopes;
     std::shared_ptr<const DenseWeights>     lm_head;
+
+    // Eagle3 reduced-vocabulary token ID mapping tables (optional).
+    // Only populated for specforge-style Eagle3 draft models where the draft
+    // vocabulary is smaller than the target vocabulary.
+    // d2t[draft_token] -> target_token   shape: [draft_vocab_size]  int32
+    // t2d[target_token] -> draft_token   shape: [target_vocab_size] int32 (-1 = absent)
+    ConstBufferPtr eagle3_d2t;
+    ConstBufferPtr eagle3_t2d;
 };
 
 using WeightsPtr = std::shared_ptr<const Weights>;

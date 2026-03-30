@@ -1,11 +1,13 @@
 #pragma once
 
 #include <memory>
+#include <utility>
 #include "kmonitor/client/MetricsReporter.h"
 #include "rtp_llm/cpp/cache/KVCacheManager.h"
 #include "rtp_llm/cpp/engine_base/Executor.h"
 #include "rtp_llm/cpp/normal_engine/NormalBatchStreamProcessor.h"
 #include "rtp_llm/cpp/core/Types.h"
+#include "rtp_llm/cpp/core/Buffer.h"
 #include "rtp_llm/cpp/metrics/RtpLLMMetrics.h"
 #include "rtp_llm/cpp/models/lora/LoraManager.h"
 #include "rtp_llm/cpp/models/eplb/ExpertBalancer.h"
@@ -107,6 +109,14 @@ protected:
                           std::vector<torch::Tensor>& draft_probs_list,
                           torch::Tensor&              draft_token_ids_t);
 
+    // Map draft-vocab sampler output to target-vocab space using eagle3_d2t_.
+    // Input  draft_all_probs:  [..., draft_vocab_size]  (GPU tensor, float)
+    // Input  draft_token_ids:  [...] or [..., 1]        (GPU tensor, int32/int64)
+    // Returns {expanded_probs [..., target_vocab_size], target_token_ids same shape as input}
+    // If eagle3_d2t_ is nullptr, returns inputs unchanged.
+    std::pair<torch::Tensor, torch::Tensor> mapDraftToTarget(const torch::Tensor& draft_all_probs,
+                                                             const torch::Tensor& draft_token_ids) const;
+
     void prepareStreams(const std::list<GenerateStreamPtr>& streams,
                         std::list<GenerateStreamPtr>&       prefill_streams,
                         std::list<GenerateStreamPtr>&       decode_streams);
@@ -131,6 +141,12 @@ private:
     std::unique_ptr<GptModel>                        draft_model_;
     std::unique_ptr<speculative::SpeculativeSampler> speculative_sampler_;
     std::unique_ptr<speculative::FastTopKSampler>    fast_topk_sampler_;
+
+    // Eagle3 reduced-vocab token-ID mapping tables (nullptr for standard models).
+    // d2t_: [draft_vocab_size] int32 on DEVICE  – draft token -> target token
+    // t2d_: [target_vocab_size] int32 on DEVICE – target token -> draft token (-1 = absent)
+    ConstBufferPtr eagle3_d2t_;
+    ConstBufferPtr eagle3_t2d_;
 
     // holder for host buffers to avoid early free before H2D copy kernel execution
     MtpBufferHolder buffer_holder_;
