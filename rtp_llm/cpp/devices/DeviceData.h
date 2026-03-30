@@ -75,14 +75,18 @@ struct DeviceInitParams {
     int64_t extra_experts  = 0;
     bool    ffn_as_service = false;
 
-    bool                       use_deepep_moe         = false;
-    int                        user_deep_gemm_num_sm  = -1;
-    bool                       use_aiter_pa           = true;
-    bool                       use_asm_pa             = true;
-    bool                       use_deepep_internode   = false;
-    bool                       use_deepep_low_latency = false;
-    bool                       is_mtp                 = false;
-    bool                       is_eagle3              = false;
+    bool use_deepep_moe         = false;
+    int  user_deep_gemm_num_sm  = -1;
+    bool use_aiter_pa           = true;
+    bool use_asm_pa             = true;
+    bool use_deepep_internode   = false;
+    bool use_deepep_low_latency = false;
+    bool is_mtp                 = false;
+    bool is_eagle3              = false;
+    // Layer indices from the score model whose hidden states are captured and
+    // cat-fed into the Eagle3 draft model's fc projection.
+    // Populated from SpeculativeExecutionConfig::eagle3_aux_hidden_state_layer_ids.
+    std::vector<int>           eagle3_selected_layer_ids = {};
     FMHAConfig                 fmha_config;
     HWKernelConfig             hw_kernel_config;
     DeviceResourceConfig       device_resource_config;
@@ -127,16 +131,16 @@ struct DeviceProperties {
     bool           enable_comm_overlap      = true;
     MicroBatchType enable_layer_micro_batch = MicroBatchType::NONE;
 
-    bool          use_deepep_moe         = false;
-    bool          use_deepep_internode   = false;
-    bool          use_deepep_low_latency = false;
-    bool          is_mtp                 = false;
-    bool          use_all_gather         = false;
-    bool          is_eagle3              = false;
-    std::set<int> eagle3_selected_layer{1, 46, 90};
-    // std::set<int> eagle3_selected_layer{0,1,2};
-    bool ffn_as_service    = false;
-    bool enable_prefill_cp = false;
+    bool use_deepep_moe         = false;
+    bool use_deepep_internode   = false;
+    bool use_deepep_low_latency = false;
+    bool is_mtp                 = false;
+    bool use_all_gather         = false;
+    bool is_eagle3              = false;
+    // Populated from DeviceInitParams::eagle3_selected_layer_ids at device init.
+    std::set<int> eagle3_selected_layer = {};
+    bool          ffn_as_service        = false;
+    bool          enable_prefill_cp     = false;
 };
 
 struct MemoryStatus {

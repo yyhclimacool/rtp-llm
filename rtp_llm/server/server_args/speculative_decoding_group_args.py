@@ -1,4 +1,20 @@
+import json
+
 from rtp_llm.server.server_args.util import str2bool
+
+
+def _parse_int_list(value: str):
+    """Parse a JSON array string like '[1, 17, 32]' into a list of ints."""
+    try:
+        result = json.loads(value)
+        if not isinstance(result, list) or not all(isinstance(x, int) for x in result):
+            raise ValueError
+        return result
+    except (ValueError, TypeError):
+        raise ValueError(
+            f"Invalid value for eagle3_aux_hidden_state_layer_ids: {value!r}. "
+            "Expected a JSON array of integers, e.g. '[1, 17, 32]'."
+        )
 
 
 def init_speculative_decoding_group_args(parser, sp_config):
@@ -74,6 +90,7 @@ def init_speculative_decoding_group_args(parser, sp_config):
         help="",
     )
 
+    # TODO(yyh): circle or cycle?
     speculative_decoding_group.add_argument(
         "--gen_num_per_cycle",
         env_name="GEN_NUM_PER_CIRCLE",
@@ -99,4 +116,16 @@ def init_speculative_decoding_group_args(parser, sp_config):
         type=str2bool,
         default=True,
         help="投机采样强制score阶段使用context attention",
+    )
+    speculative_decoding_group.add_argument(
+        "--eagle3_aux_hidden_state_layer_ids",
+        env_name="EAGLE3_AUX_HIDDEN_STATE_LAYER_IDS",
+        bind_to=(sp_config, "eagle3_aux_hidden_state_layer_ids"),
+        type=_parse_int_list,
+        default=[],
+        help=(
+            "Eagle3 草稿模型所需的主模型 hidden state 层号列表，JSON 数组格式，"
+            "例如 '[1, 17, 32]'。必须与草稿模型训练时使用的层号一致，"
+            "且所有层号需在主模型层数范围内。"
+        ),
     )

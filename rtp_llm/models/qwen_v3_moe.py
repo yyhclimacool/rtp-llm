@@ -1,8 +1,17 @@
+import functools
 from typing import TYPE_CHECKING, Any, List, Optional
 
 from rtp_llm.config.model_config import ModelConfig
 from rtp_llm.model_factory_register import register_model
-from rtp_llm.model_loader.ffn_weight import MoeAtomicWeight, MoeConfig, MoeWeight
+from rtp_llm.model_loader.attn_weight import AttnAtomicWeight, AttnConfig
+from rtp_llm.model_loader.ffn_weight import (
+    FfnAtomicWeight,
+    FfnConfig,
+    FfnWeight,
+    MoeAtomicWeight,
+    MoeConfig,
+    MoeWeight,
+)
 from rtp_llm.model_loader.model_weight_info import ModelWeightInfo
 from rtp_llm.model_loader.weight_module import AtomicWeight, WeightModule
 from rtp_llm.models.qwen_v2 import QWenV2, QWenV2Weight
@@ -11,9 +20,12 @@ from rtp_llm.utils.model_weight import (
     CkptWeightInfo,
     W,
     identity,
+    merge_qkv_hf,
     stack_,
     stack_moe_w1,
     transpose,
+    transpose_pad,
+    zeros,
 )
 
 
@@ -27,7 +39,7 @@ class QWenV3MoeWeight(QWenV2MoeWeight):
         merge_lora=False,
         vit_config=None,
         prefix="",
-        **kwargs: Any
+        **kwargs: Any,
     ):
         super().__init__(
             model_config=model_config,
@@ -37,7 +49,7 @@ class QWenV3MoeWeight(QWenV2MoeWeight):
             merge_lora=merge_lora,
             vit_config=vit_config,
             prefix=prefix,
-            **kwargs
+            **kwargs,
         )
         self.bias = False
 
@@ -190,3 +202,225 @@ class Qwen3MoeEagle3(QWenV2):
 register_model("qwen_3_moe", Qwen3Moe, ["Qwen3MoeForCausalLM"])
 register_model("qwen_3_moe_eagle3", Qwen3MoeEagle3, ["Qwen3MoeForCausalLMEagle"])
 register_model("qwen3_coder_moe", Qwen3Moe, [])
+
+
+# ---------------------------------------------------------------------------
+# Specforge LlamaForCausalLMEagle3 draft-model support
+# ---------------------------------------------------------------------------
+#
+# Specforge trains Eagle3 draft models whose checkpoint layout differs from
+# the official Qwen3-MoE Eagle3 format:
+#
+#   fc.weight                                [hidden, 3*hidden]    eagle3_fc_proj
+#   lm_head.weight                           [draft_vocab, hidden] lm_head
+#   norm.weight                              [hidden]              final_ln_gamma
+#   midlayer.self_attn.q_proj.weight         [Q_dim, 2*hidden]     ↘
+#   midlayer.self_attn.k_proj.weight         [K_dim, 2*hidden]      attn_qkv_w
+#   midlayer.self_attn.v_proj.weight         [V_dim, 2*hidden]     ↗
+#   midlayer.self_attn.o_proj.weight         [hidden, Q_dim]       attn_o_w
+#   midlayer.mlp.gate_proj.weight            [inter, hidden]       ffn_w1
+#   midlayer.mlp.up_proj.weight              [inter, hidden]       ffn_w3
+#   midlayer.mlp.down_proj.weight            [hidden, inter]       ffn_w2
+#   midlayer.hidden_norm.weight              [hidden]              eagle3_fc_norm_gamma
+#   midlayer.input_layernorm.weight          [hidden]              pre_ln_gamma +
+#                                                                  eagle3_input_norm_gamma
+#   midlayer.post_attention_layernorm.weight [hidden]              post_ln_gamma
+#   d2t / t2d                                                      (ignored)
+#
+# IMPORTANT – embed_tokens:
+#   Specforge intentionally omits embed_tokens.weight from the saved checkpoint
+#   (it expects the serving framework to reuse the main model's embedding table).
+#   Before starting the server, merge the main model's embedding into the eagle3
+#   checkpoint once using the provided merge_embed_tokens.py helper script.
+# ---------------------------------------------------------------------------
+
+
+class SpecforgeLlamaEagle3Weight(QWenV2Weight):
+    """Weight loader for specforge LlamaForCausalLMEagle3 draft checkpoints."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.bias = False
+        self._use_qk_norm = False  # Llama-style attention: no qk_norm
+
+    def _get_weight_info(self):
+        assert self._num_layers == 1, (
+            f"SpecforgeLlamaEagle3 draft model must have exactly 1 transformer "
+            f"layer (num_hidden_layers=1), got {self._num_layers}"
+        )
+
+        layer_weights = [self._get_specforge_layer_weight_info()]
+
+        weights = [
+            # embed_tokens.weight must be present in the checkpoint.
+            # If missing, run the merge_embed_tokens.py conversion script first.
+            AtomicWeight(
+                W.embedding,
+                [CkptWeightInfo("model.embed_tokens.weight", identity)],
+                identity,
+            ),
+            # lm_head maps to draft_vocab_size rows; loaded as-is.
+            AtomicWeight(
+                W.lm_head,
+                [CkptWeightInfo("lm_head.weight", identity)],
+                identity,
+            ),
+            # Final RMSNorm (self.norm) applied by compute_logits before lm_head.
+            AtomicWeight(
+                W.final_ln_gamma,
+                [CkptWeightInfo("norm.weight", identity)],
+                identity,
+            ),
+            AtomicWeight(
+                W.final_ln_beta,
+                [],
+                functools.partial(zeros, shape=[self._hidden_size]),
+            ),
+            # Draft-to-target token ID mapping (1-D int32 lookup table).
+            # d2t[draft_token] -> target_token  shape: [draft_vocab_size]
+            # Used by MtpExecutor to remap draft logits/tokens to target vocab space
+            # after each specforge Eagle3 sampling step.
+            AtomicWeight(
+                W.eagle3_d2t,
+                [CkptWeightInfo("d2t", identity)],
+                identity,
+            ),
+            # Target-to-draft mapping (stored for completeness; not applied at runtime
+            # because the draft model reuses the main model's full embed_tokens table).
+            # t2d[target_token] -> draft_token   shape: [target_vocab_size], -1 if absent
+            AtomicWeight(
+                W.eagle3_t2d,
+                [CkptWeightInfo("t2d", identity)],
+                identity,
+            ),
+        ]
+
+        return ModelWeightInfo(layer_weights=layer_weights, weights=weights)
+
+    def _get_specforge_layer_weight_info(self) -> List[WeightModule]:
+        """Build weight descriptors for the single 'midlayer' transformer block.
+
+        Notes on the double-use of midlayer.input_layernorm.weight:
+          - pre_ln_gamma      : applied inside GptLayer's standard attention path
+                                (line 1322-1350 of GptModel.cc).  The input at
+                                that point is cat(input_norm, fc_norm) [2*hidden],
+                                so this weight acts on the already-normed concat.
+          - eagle3_input_norm : applied in Eagle3Model::embeddingPost on the raw
+                                token embedding [hidden] before the concat.
+          Both slots share the identical tensor, matching how Qwen3MoeEagle3Weight
+          maps model.layers.0.input_layernorm.weight to both roles.
+        """
+        attn_config = AttnConfig(
+            hidden_size=self._hidden_size,
+            size_per_head=self._size_per_head,
+            head_num=self._head_num,
+            head_num_kv=self._head_num_kv,
+        )
+        ffn_config = FfnConfig(
+            is_gated_activation=self._is_gated_activation,
+            align_size=self._align_size,
+            is_moe=False,
+        )
+        align_size = self._align_size
+
+        # midlayer.input_layernorm is shared between pre_ln_gamma and
+        # eagle3_input_norm_gamma (see docstring above).
+        input_ln_key = "midlayer.input_layernorm.weight"
+
+        return [
+            # ── Standard pre-attention layernorm slot ──────────────────────
+            AtomicWeight(
+                W.pre_ln_gamma,
+                [CkptWeightInfo(input_ln_key, identity)],
+                identity,
+            ),
+            # ── Attention ─────────────────────────────────────────────────
+            # q/k/v input dimension is 2*hidden (cat of normed_emb + normed_fc).
+            # No qk_norm (Llama-style).
+            AttnAtomicWeight(
+                W.attn_qkv_w,
+                [
+                    CkptWeightInfo("midlayer.self_attn.q_proj.weight", identity),
+                    CkptWeightInfo("midlayer.self_attn.k_proj.weight", identity),
+                    CkptWeightInfo("midlayer.self_attn.v_proj.weight", identity),
+                ],
+                functools.partial(merge_qkv_hf),
+                config=attn_config,
+            ),
+            AttnAtomicWeight(
+                W.attn_o_w,
+                [CkptWeightInfo("midlayer.self_attn.o_proj.weight", identity)],
+                transpose,
+                config=attn_config,
+            ),
+            AtomicWeight(
+                W.post_ln_gamma,
+                [CkptWeightInfo("midlayer.post_attention_layernorm.weight", identity)],
+                identity,
+                config=attn_config,
+            ),
+            # ── FFN (SiLU-gated, matching LlamaMLP) ───────────────────────
+            FfnWeight(
+                sub_weights=[
+                    FfnAtomicWeight(
+                        W.ffn_w1,
+                        [CkptWeightInfo("midlayer.mlp.gate_proj.weight", identity)],
+                        functools.partial(transpose_pad, align_size=align_size, dim=0),
+                        config=ffn_config,
+                    ),
+                    FfnAtomicWeight(
+                        W.ffn_w3,
+                        [CkptWeightInfo("midlayer.mlp.up_proj.weight", identity)],
+                        functools.partial(transpose_pad, align_size=align_size, dim=0),
+                        config=ffn_config,
+                    ),
+                    FfnAtomicWeight(
+                        W.ffn_w2,
+                        [CkptWeightInfo("midlayer.mlp.down_proj.weight", identity)],
+                        functools.partial(transpose_pad, align_size=align_size, dim=1),
+                        config=ffn_config,
+                    ),
+                ],
+                config=ffn_config,
+            ),
+            # ── Eagle3-specific weights ────────────────────────────────────
+            # fc: project 3 concatenated main-model hidden layers → hidden_size.
+            AtomicWeight(
+                W.eagle3_fc_proj,
+                [CkptWeightInfo("fc.weight", identity)],
+                transpose,
+            ),
+            # Norm applied to the fc-projected hidden state in embeddingPost.
+            AtomicWeight(
+                W.eagle3_fc_norm_gamma,
+                [CkptWeightInfo("midlayer.hidden_norm.weight", identity)],
+                identity,
+            ),
+            # Norm applied to the token embedding in embeddingPost.
+            # Shares the same underlying tensor as pre_ln_gamma (see docstring).
+            AtomicWeight(
+                W.eagle3_input_norm_gamma,
+                [CkptWeightInfo(input_ln_key, identity)],
+                identity,
+            ),
+        ]
+
+
+class SpecforgeLlamaEagle3(QWenV2):
+    """Eagle3 draft model trained by specforge on a Llama/Qwen3-dense backbone."""
+
+    @classmethod
+    def _create_config(cls, ckpt_path: str):
+        config = super()._create_config(ckpt_path)
+        # Llama-style attention: no per-head QK normalisation.
+        config.qk_norm = False
+        return config
+
+    @staticmethod
+    def get_weight_cls():
+        return SpecforgeLlamaEagle3Weight
+
+
+register_model(
+    "specforge_llama_eagle3", SpecforgeLlamaEagle3, ["LlamaForCausalLMEagle3"]
+)

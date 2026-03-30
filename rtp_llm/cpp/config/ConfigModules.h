@@ -281,7 +281,11 @@ struct SpeculativeExecutionConfig {
     bool            force_score_context_attention = true;
     std::string     quantization                  = "";
     std::string     checkpoint_path               = "";
-    std::string     to_string() const;
+    // Eagle3: layer indices from the score model whose hidden states are
+    // concatenated and fed into the draft model's fc projection.
+    // Must match the layers used during draft-model training.
+    std::vector<int> eagle3_aux_hidden_state_layer_ids = {};
+    std::string      to_string() const;
 
     // Helper functions for enum conversion
     static SpeculativeType from_string(const std::string& str);
