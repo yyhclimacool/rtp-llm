@@ -220,6 +220,8 @@ void MtpBatchStreamProcessor::prepareOneStepSpecDecodeModelInput(const StreamGro
         lm_output_indexes->data<int>()[i] = i;
     }
     model_input.lm_output_indexes = lm_output_indexes;
+    RTP_LLM_LOG_INFO("[Eagle3 diag] prepareDecodeDraftModelInput DONE: last_hidden_states=%s",
+                     model_input.last_hidden_states ? "NON-NULL" : "nullptr");
 }
 
 void MtpBatchStreamProcessor::updateDecodeDraftModelInput(GptModelInputs&        model_input,
@@ -463,10 +465,15 @@ void MtpBatchStreamProcessor::gatherHiddenStates(const StreamGroups& stream_grou
     size_t            hidden_size = 0;
 
     size_t all_hidden_tokens_num = 0;
+    int    stream_idx            = 0;
     for (auto& stream : all_streams) {
         auto hidden_states = stream->getSPOutputBuffer()->hidden_states;
         RTP_LLM_CHECK(hidden_states != nullptr);
         RTP_LLM_CHECK(hidden_states->dim() == 2);
+        RTP_LLM_LOG_INFO("[Eagle3 gather] stream[%d] sp_output hidden shape=[%zu, %zu]",
+                         stream_idx++,
+                         hidden_states->shape()[0],
+                         hidden_states->shape()[1]);
         if (type == rtp_llm::DataType::TYPE_INVALID) {
             type = hidden_states->type();
         } else {
@@ -521,6 +528,9 @@ void MtpBatchStreamProcessor::gatherHiddenStates(const StreamGroups& stream_grou
         }
     }
 
+    RTP_LLM_LOG_INFO("[Eagle3 gather] final all_hidden_states shape=[%zu, %zu] -> model_input.last_hidden_states",
+                     all_hidden_states ? all_hidden_states->shape()[0] : 0,
+                     all_hidden_states ? all_hidden_states->shape()[1] : 0);
     model_input.last_hidden_states = all_hidden_states;
 }
 

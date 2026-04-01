@@ -10,6 +10,7 @@
 #include "rtp_llm/cpp/models/models_weight/W.h"
 #include "rtp_llm/cpp/utils/AssertUtils.h"
 #include "rtp_llm/cpp/utils/StringUtil.h"
+#include "rtp_llm/cpp/utils/Logger.h"
 
 #include <memory>
 
@@ -40,7 +41,10 @@ EmbeddingPostOutput Eagle3Model::embeddingPost(const rtp_llm::BufferPtr& hidden_
         return {hidden_states, nullptr};
     }
 
-    // printBufferData(*inputs.last_hidden_states, "last_hidden_states");
+    RTP_LLM_LOG_INFO(
+        "[Eagle3 embeddingPost] last_hidden_states shape=%s fc_proj_kernel shape=%s",
+        torch::str(Buffer2torchTensor(inputs.last_hidden_states, false).sizes()).c_str(),
+        torch::str(Buffer2torchTensor(*(weights_.layers[0].eagle3_fc_proj->kernel), false).sizes()).c_str());
 
     auto proj_last_hidden_states =
         device_->gemm({*inputs.last_hidden_states, *(weights_.layers[0].eagle3_fc_proj->kernel)});

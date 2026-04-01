@@ -1,6 +1,8 @@
 import functools
 from typing import TYPE_CHECKING, Any, List, Optional
 
+import torch
+
 from rtp_llm.config.model_config import ModelConfig
 from rtp_llm.model_factory_register import register_model
 from rtp_llm.model_loader.attn_weight import AttnAtomicWeight, AttnConfig
@@ -253,7 +255,6 @@ class SpecforgeLlamaEagle3Weight(QWenV2Weight):
 
         weights = [
             # embed_tokens.weight must be present in the checkpoint.
-            # If missing, run the merge_embed_tokens.py conversion script first.
             AtomicWeight(
                 W.embedding,
                 [CkptWeightInfo("model.embed_tokens.weight", identity)],
@@ -280,10 +281,12 @@ class SpecforgeLlamaEagle3Weight(QWenV2Weight):
             # d2t[draft_token] -> target_token  shape: [draft_vocab_size]
             # Used by MtpExecutor to remap draft logits/tokens to target vocab space
             # after each specforge Eagle3 sampling step.
+            # data_type=torch.int32: preserve exact integer values (avoid bf16 precision loss).
             AtomicWeight(
                 W.eagle3_d2t,
                 [CkptWeightInfo("d2t", identity)],
                 identity,
+                data_type=torch.int32,
             ),
             # Target-to-draft mapping (stored for completeness; not applied at runtime
             # because the draft model reuses the main model's full embed_tokens table).

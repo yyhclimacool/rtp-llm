@@ -1703,6 +1703,15 @@ GptModelOutputs GptModel::forwardPostLayers(rtp_llm::BufferPtr       input,
                     std::move(softmax_result)};
         }
 
+        if (merged_eagle3_hidden) {
+            RTP_LLM_LOG_INFO("[Eagle3 output] model_output.all_hidden_states = merged shape=[%zu, %zu]",
+                             merged_eagle3_hidden->shape()[0],
+                             merged_eagle3_hidden->shape()[1]);
+        } else {
+            RTP_LLM_LOG_INFO("[Eagle3 output] merged_eagle3_hidden is null, using plain hidden shape=[%zu, %zu]",
+                             hidden->shape()[0],
+                             hidden->shape()[1]);
+        }
         hidden = merged_eagle3_hidden ? merged_eagle3_hidden : hidden;
         return {std::move(logits), std::move(last_hidden), std::move(hidden), nullptr, std::move(softmax_result)};
     } else {
@@ -1736,8 +1745,14 @@ GptModelOutputs GptModel::forward(const GptModelInputs& inputs) {
             if (dynamic_cast<Eagle3Model*>(this) == nullptr && device_props_.is_eagle3
                 && device_props_.eagle3_selected_layer.count(i) > 0) {
                 eagle3_selected_hidden.push_back(device_->clone({*layer_inputs.hidden, AllocationType::DEVICE}));
+                RTP_LLM_LOG_INFO("[Eagle3 collect] layer %d hidden shape=[%s]",
+                                 i,
+                                 torch::str(Buffer2torchTensor(layer_inputs.hidden, false).sizes()).c_str());
             }
         }
+        RTP_LLM_LOG_INFO("[Eagle3 collect] total selected layers collected: %zu / %zu configured",
+                         eagle3_selected_hidden.size(),
+                         device_props_.eagle3_selected_layer.size());
     }
 
     BufferPtr merged_eagle3_hidden = mergeEagle3HiddenState(layer_inputs, eagle3_selected_hidden);
@@ -1789,13 +1804,15 @@ bool GptModel::containMoeLayer() {
 BufferPtr GptModel::mergeEagle3HiddenState(const GptLayerInputs&   layer_inputs,
                                            std::vector<BufferPtr>& eagle3_selected_hidden) {
     if (eagle3_selected_hidden.empty()) {
+        RTP_LLM_LOG_INFO("[Eagle3 merge] eagle3_selected_hidden is empty, returning nullptr");
         return nullptr;
     }
 
     std::vector<torch::Tensor> eagle3_selected_hidden_tensor;
-    for (int i = 0; i < eagle3_selected_hidden.size(); i++) {
-        eagle3_selected_hidden_tensor.push_back(Buffer2torchTensor(eagle3_selected_hidden[i], false));
-        // printBufferData(*eagle3_selected_hidden[i], "eagle3_selected_hidden_tensor");
+    for (int i = 0; i < (int)eagle3_selected_hidden.size(); i++) {
+        auto t = Buffer2torchTensor(eagle3_selected_hidden[i], false);
+        eagle3_selected_hidden_tensor.push_back(t);
+        RTP_LLM_LOG_INFO("[Eagle3 merge] input[%d] shape=%s", i, torch::str(t.sizes()).c_str());
     }
 
     size_t        micro_batch_size = layer_inputs.micro_batch_inputs.size();
@@ -1814,6 +1831,9 @@ BufferPtr GptModel::mergeEagle3HiddenState(const GptLayerInputs&   layer_inputs,
         merged_hidden_states_tensor = torch::cat(merged_row_hidden_states, 0);
     }
 
+    RTP_LLM_LOG_INFO("[Eagle3 merge] merged shape=%s (micro_batch_size=%zu)",
+                     torch::str(merged_hidden_states_tensor.sizes()).c_str(),
+                     micro_batch_size);
     return device_->clone({*torchTensor2Buffer(merged_hidden_states_tensor), AllocationType::DEVICE});
 }
 
