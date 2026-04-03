@@ -15,7 +15,8 @@ public:
                             const SpeculativeExecutionConfig&  sp_config,
                             bool                               warm_up):
         NormalBatchStreamProcessor(model_config, pd_sep_config, profiling_debug_logging_config, cache_config, warm_up),
-        propose_step_(sp_config.gen_num_per_cycle) {}
+        propose_step_(sp_config.gen_num_per_cycle),
+        is_eagle3_(sp_config.type == SP_TYPE_EAGLE3) {}
 
     absl::Status dispatchPrefill(const StreamGroups& stream_groups,
                                  const MergedOutput& prefill_output,
@@ -23,7 +24,8 @@ public:
 
     absl::Status dispatchDecode(const StreamGroups&                          stream_groups,
                                 const speculative::SpeculativeSamplerOutput& spec_decode_output,
-                                const MergedOutput&                          draft_prefill_output) const;
+                                const MergedOutput&                          draft_prefill_output,
+                                const rtp_llm::BufferPtr&                    main_model_hidden = nullptr) const;
 
     absl::StatusOr<GptModelInputs> gatherDecodeModelInput(const StreamGroups& stream_groups) const;
 
@@ -75,11 +77,13 @@ protected:
     void prepareDecodeSpecUpdateInfo(const StreamGroups&                          stream_groups,
                                      const speculative::SpeculativeSamplerOutput& spec_decode_output,
                                      const MergedOutput&                          draft_prefill_output,
-                                     std::vector<StreamSpecUpdateInfo>&           spec_update_infos) const;
+                                     std::vector<StreamSpecUpdateInfo>&           spec_update_infos,
+                                     const rtp_llm::BufferPtr&                    main_model_hidden = nullptr) const;
 
     void gatherHiddenStates(const StreamGroups& stream_groups, GptModelInputs& model_input) const;
 
 protected:
-    int propose_step_;
+    int  propose_step_;
+    bool is_eagle3_;
 };
 }  // namespace rtp_llm

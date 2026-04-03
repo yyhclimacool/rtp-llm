@@ -402,6 +402,20 @@ absl::Status MtpExecutor::prefillStep(const std::list<GenerateStreamPtr>& stream
             mapDraftToTarget(fast_topk_sampler_output.all_probs, fast_topk_sampler_output.token_ids);
         draft_sampler_output.all_probs = torchTensor2Buffer(mapped_probs);
         draft_sampler_output.token_ids = torchTensor2Buffer(mapped_ids);
+
+        {
+            auto        ids_cpu = mapped_ids.to(torch::kCPU).to(torch::kInt32).contiguous();
+            int         n       = ids_cpu.numel();
+            std::string s;
+            for (int j = 0; j < std::min(n, 16); j++) {
+                if (j)
+                    s += ",";
+                s += std::to_string(ids_cpu.data_ptr<int>()[j]);
+            }
+            if (n > 16)
+                s += "...";
+            RTP_LLM_LOG_INFO("[SP trace] prefill draft token(s): [%s] (n=%d)", s.c_str(), n);
+        }
     }
 
     // collect metrics
@@ -582,13 +596,9 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
                 batch_stream_processor_->prepareOneStepSpecDecodeModelInput(stream_groups, model_input);
             } else {
                 batch_stream_processor_->prepareDecodeDraftModelInput(stream_groups, model_input);
-                // prepareDecodeDraftModelInput (multi-step) does NOT clear last_hidden_states.
-                // For Eagle3, it must be nullptr so embeddingPost uses the "duplicate" path;
-                // the [N, 2560] value left by gatherHiddenStates would cause a GEMM shape mismatch
-                // against the fc_proj kernel [7680, 2560].
-                if (eagle3_d2t_) {
-                    model_input.last_hidden_states = nullptr;
-                }
+                // For Eagle3, gatherHiddenStates now returns the main model's [N, 7680]
+                // merged auxiliary hidden states (stored in sp_output_buffer), which is
+                // exactly what Eagle3Model::embeddingPost fc_proj expects.
             }
         }
         RTP_LLM_LOG_INFO("[Eagle3 diag] decodeStep AFTER prepare: last_hidden_states=%s",
@@ -612,6 +622,21 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
 
     {
         RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(target_model_verify)");
+        if (isTpRank0() && model_input.combo_tokens) {
+            auto combo_cpu =
+                Buffer2torchTensor(model_input.combo_tokens, false).to(torch::kCPU).to(torch::kInt32).contiguous();
+            int         n = combo_cpu.numel();
+            auto*       p = combo_cpu.data_ptr<int>();
+            std::string s;
+            for (int j = 0; j < std::min(n, 32); j++) {
+                if (j)
+                    s += ",";
+                s += std::to_string(p[j]);
+            }
+            if (n > 32)
+                s += "...";
+            RTP_LLM_LOG_INFO("[SP trace] target VERIFY input combo_tokens: [%s] (n=%d)", s.c_str(), n);
+        }
         maybePrintModelInput(model_input, "decode target model");
         model_input.is_target_verify        = true;
         model_input.kv_cache_layer_to_group = target_kv_cache_layer_to_group;
@@ -664,11 +689,42 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
 
             // rejection sampling
             speculative_sampler_output = speculative_sampler_->forward(streams, draft_sampler_output, sampler_output);
+
+            for (size_t b = 0; b < speculative_sampler_output.accept_len.size() && b < 4; b++) {
+                int         accept_n = speculative_sampler_output.accept_len[b];
+                auto*       atp      = speculative_sampler_output.accept_tokens[b]->data<int>();
+                std::string accepted_s;
+                for (int j = 0; j < accept_n; j++) {
+                    if (j)
+                        accepted_s += ",";
+                    accepted_s += std::to_string(atp[j]);
+                }
+                // draft_token_ids_t shape: [batch, propose_step_+1]
+                std::string draft_s;
+                if (draft_token_ids_t.defined()) {
+                    auto row = draft_token_ids_t.to(torch::kCPU).to(torch::kInt32).contiguous();
+                    for (int k = 0; k < (int)(propose_step_ + 1); k++) {
+                        if (k)
+                            draft_s += ",";
+                        draft_s += std::to_string(row[(int)b][k].item<int>());
+                    }
+                }
+                RTP_LLM_LOG_INFO("[SP trace] batch[%zu] accept_len=%d/%zu  draft=[%s]  accepted=[%s]",
+                                 b,
+                                 accept_n,
+                                 propose_step_,
+                                 draft_s.c_str(),
+                                 accepted_s.c_str());
+            }
         }
         // NOTE: here will have cuda device sync before update model input
         batch_stream_processor_->updateDecodePostDraftModelInput(
             model_input, model_output, speculative_sampler_output, batch_size, hidden_states_d_t, total_accept_len);
     }
+
+    // For Eagle3 dispatch: save the main model's [total_accept_len, 7680] hidden states
+    // before draft prefill forward potentially overwrites model_input.last_hidden_states.
+    BufferPtr main_model_hidden_for_dispatch = eagle3_d2t_ ? model_input.last_hidden_states : nullptr;
 
     {
         RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(tp_sync_post_rejection)");
@@ -704,6 +760,20 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
             mapDraftToTarget(fast_topk_sampler_output.all_probs, fast_topk_sampler_output.token_ids);
         draft_prefill_sampler_output.all_probs = torchTensor2Buffer(mapped_probs);
         draft_prefill_sampler_output.token_ids = torchTensor2Buffer(mapped_ids);
+
+        {
+            auto        ids_cpu = mapped_ids.to(torch::kCPU).to(torch::kInt32).contiguous();
+            int         n       = ids_cpu.numel();
+            std::string s;
+            for (int j = 0; j < std::min(n, 16); j++) {
+                if (j)
+                    s += ",";
+                s += std::to_string(ids_cpu.data_ptr<int>()[j]);
+            }
+            if (n > 16)
+                s += "...";
+            RTP_LLM_LOG_INFO("[SP trace] post-verify draft token(s): [%s] (n=%d)", s.c_str(), n);
+        }
     }
 
     // collect metrics
@@ -731,7 +801,8 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
         auto result = batch_stream_processor_->dispatchDecode(
             stream_groups,
             speculative_sampler_output,
-            {std::move(draft_prefill_model_output), std::move(draft_prefill_sampler_output)});
+            {std::move(draft_prefill_model_output), std::move(draft_prefill_sampler_output)},
+            main_model_hidden_for_dispatch);
         // clean holder tensors from grpc
         for (auto& stream : streams) {
             stream->getSPOutputBuffer()->tensors_holder.clear();
@@ -905,6 +976,20 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
         // Reshape probs to [batch, 1, vocab] for later cat.
         auto draft_probs_reshape = mapped_probs.reshape({(int)batch_size, 1, -1});
 
+        {
+            auto        ids_cpu = draft_token_ids.to(torch::kCPU).contiguous();
+            int         n       = ids_cpu.numel();
+            std::string s;
+            for (int j = 0; j < std::min(n, 16); j++) {
+                if (j)
+                    s += ",";
+                s += std::to_string(ids_cpu.data_ptr<int>()[j]);
+            }
+            if (n > 16)
+                s += "...";
+            RTP_LLM_LOG_INFO("[SP trace] draftDecode iter=%d draft token(s): [%s] (n=%d)", i, s.c_str(), n);
+        }
+
         draft_token_ids_list.push_back(draft_token_ids);
         draft_probs_list.push_back(draft_probs_reshape);
 
@@ -912,10 +997,10 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
         if (i != propose_step_ - 2) {
             batch_stream_processor_->updateDecodeDraftModelInput(
                 model_input, draft_decode_model_output, draft_token_ids);
-            // For Eagle3, last_hidden_states must come from the main model's auxiliary hidden states
-            // (shape [N, 7680]). The draft model's own all_hidden_states has shape [N, 2560], which
-            // does NOT match the fc_proj input dimension. Reset to nullptr so that Eagle3Model::embeddingPost
-            // uses the "duplicate" path for subsequent draft decode steps.
+            // Eagle3: step 0 used the main model's [N, 7680] auxiliary hidden states from
+            // sp_output_buffer. The draft model's own output has different dimensions and
+            // cannot be fed back into fc_proj. Reset to nullptr so Eagle3Model::embeddingPost
+            // uses the "duplicate" path (cat [embed, embed]) for subsequent draft steps.
             if (eagle3_d2t_) {
                 model_input.last_hidden_states = nullptr;
             }
@@ -927,6 +1012,23 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
         // prepare spec decode input
         draft_token_ids_t =
             torch::cat(draft_token_ids_list, 1).reshape({(int)batch_size, (int)(propose_step_ + 1)}).contiguous();
+
+        {
+            auto ids_cpu = draft_token_ids_t.to(torch::kCPU).to(torch::kInt32).contiguous();
+            for (int b = 0; b < (int)batch_size && b < 4; b++) {
+                std::string s;
+                for (int k = 0; k < (int)(propose_step_ + 1); k++) {
+                    if (k)
+                        s += ",";
+                    s += std::to_string(ids_cpu[b][k].item<int>());
+                }
+                RTP_LLM_LOG_INFO(
+                    "[SP trace] draft ALL tokens batch[%d]: [%s] (target_token, propose_token, draft_0..%zu)",
+                    b,
+                    s.c_str(),
+                    propose_step_ - 2);
+            }
+        }
 
         auto lm_output_indexes = device_->allocateBuffer(
             {rtp_llm::DataType::TYPE_INT32, {batch_size * (propose_step_ + 1)}, rtp_llm::AllocationType::HOST}, {});

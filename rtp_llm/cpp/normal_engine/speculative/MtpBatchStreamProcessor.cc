@@ -30,12 +30,14 @@ absl::Status MtpBatchStreamProcessor::dispatchPrefill(const StreamGroups& stream
 
 absl::Status MtpBatchStreamProcessor::dispatchDecode(const StreamGroups&                          stream_groups,
                                                      const speculative::SpeculativeSamplerOutput& spec_decode_output,
-                                                     const MergedOutput& draft_prefill_output) const {
+                                                     const MergedOutput&                          draft_prefill_output,
+                                                     const rtp_llm::BufferPtr& main_model_hidden) const {
     RTP_LLM_LOG_DEBUG(__PRETTY_FUNCTION__);
 
     std::vector<StreamSpecUpdateInfo> spec_update_infos;
 
-    prepareDecodeSpecUpdateInfo(stream_groups, spec_decode_output, draft_prefill_output, spec_update_infos);
+    prepareDecodeSpecUpdateInfo(
+        stream_groups, spec_decode_output, draft_prefill_output, spec_update_infos, main_model_hidden);
 
     // to avoid cuda sync, we need to set propose token in extra loop
     updateProposeTokens(stream_groups, draft_prefill_output, spec_update_infos);
@@ -404,8 +406,17 @@ void MtpBatchStreamProcessor::preparePrefillSpecUpdateInfo(const StreamGroups&  
 
         BufferPtr last_hidden_states = nullptr;
         if (propose_step_ > 1) {
-            last_hidden_states = draft_model_output.all_hidden_states->slice(token_offset + token_size - 1, 1, false);
-            last_hidden_states->updateParent(draft_model_output.all_hidden_states);
+            if (is_eagle3_) {
+                // Eagle3: store the main model's merged auxiliary hidden states [1, 7680]
+                // so the draft model's embeddingPost can use fc_proj in the next decode step.
+                const auto& main_hidden = prefill_output.model_output.all_hidden_states;
+                last_hidden_states      = main_hidden->slice(token_offset + token_size - 1, 1, false);
+                last_hidden_states->updateParent(main_hidden);
+            } else {
+                last_hidden_states =
+                    draft_model_output.all_hidden_states->slice(token_offset + token_size - 1, 1, false);
+                last_hidden_states->updateParent(draft_model_output.all_hidden_states);
+            }
         }
 
         spec_update_infos.push_back(
@@ -421,7 +432,8 @@ void MtpBatchStreamProcessor::prepareDecodeSpecUpdateInfo(
     const StreamGroups&                          stream_groups,
     const speculative::SpeculativeSamplerOutput& spec_decode_output,
     const MergedOutput&                          draft_prefill_output,
-    std::vector<StreamSpecUpdateInfo>&           spec_update_infos) const {
+    std::vector<StreamSpecUpdateInfo>&           spec_update_infos,
+    const rtp_llm::BufferPtr&                    main_model_hidden) const {
     const auto& accept_len    = spec_decode_output.accept_len;
     const auto& accept_tokens = spec_decode_output.accept_tokens;
 
@@ -442,9 +454,16 @@ void MtpBatchStreamProcessor::prepareDecodeSpecUpdateInfo(
 
         BufferPtr last_hidden_states = nullptr;
         if (propose_step_ > 1) {
-            last_hidden_states =
-                draft_model_output.all_hidden_states->slice(token_offset + accept_len[batch_idx_out] - 1, 1, false);
-            last_hidden_states->updateParent(draft_model_output.all_hidden_states);
+            if (is_eagle3_ && main_model_hidden) {
+                // Eagle3: store the main model's merged auxiliary hidden states [1, 7680]
+                // at the last accepted position for this stream.
+                last_hidden_states = main_model_hidden->slice(token_offset + accept_len[batch_idx_out] - 1, 1, false);
+                last_hidden_states->updateParent(main_model_hidden);
+            } else {
+                last_hidden_states =
+                    draft_model_output.all_hidden_states->slice(token_offset + accept_len[batch_idx_out] - 1, 1, false);
+                last_hidden_states->updateParent(draft_model_output.all_hidden_states);
+            }
         }
 
         spec_update_infos.push_back({accept_tokens[batch_idx_out],
