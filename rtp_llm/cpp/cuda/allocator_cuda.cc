@@ -106,13 +106,7 @@ void* Allocator<AllocatorType::CUDA>::doMalloc(size_t size) {
 }
 
 void* Allocator<AllocatorType::CUDA>::doMallocSync(size_t size) {
-    void* ptr = nullptr;
-    auto  err = cudaMalloc(&ptr, (size_t)(ceil(size / 128.)) * 128);
-    if (err != cudaSuccess) {
-        cudaGetLastError();
-        check_cuda_value(err);
-    }
-    return ptr;
+    return doMalloc(size);
 }
 
 void Allocator<AllocatorType::CUDA>::doFree(void* address) {

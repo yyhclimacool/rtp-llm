@@ -171,13 +171,6 @@ void DeviceFactory::initDevices(const ParallelismConfig&           parallelism_c
         RTP_LLM_LOG_INFO("device_params.eagle3 true");
         if (!sp_config.eagle3_aux_hidden_state_layer_ids.empty()) {
             device_params.eagle3_selected_layer_ids = sp_config.eagle3_aux_hidden_state_layer_ids;
-            std::string ids_str;
-            for (size_t i = 0; i < device_params.eagle3_selected_layer_ids.size(); ++i) {
-                if (i)
-                    ids_str += ", ";
-                ids_str += std::to_string(device_params.eagle3_selected_layer_ids[i]);
-            }
-            RTP_LLM_LOG_INFO("eagle3_selected_layer_ids set to [%s]", ids_str.c_str());
         } else {
             RTP_LLM_LOG_WARNING(
                 "eagle3 is enabled but EAGLE3_AUX_HIDDEN_STATE_LAYER_IDS is not set. "

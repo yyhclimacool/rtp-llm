@@ -285,8 +285,9 @@ std::string SpeculativeExecutionConfig::to_string() const {
         << "checkpoint_path: " << checkpoint_path << "\n"
         << "eagle3_aux_hidden_state_layer_ids: [";
     for (size_t i = 0; i < eagle3_aux_hidden_state_layer_ids.size(); ++i) {
-        if (i)
+        if (i) {
             oss << ", ";
+        }
         oss << eagle3_aux_hidden_state_layer_ids[i];
     }
     oss << "]";

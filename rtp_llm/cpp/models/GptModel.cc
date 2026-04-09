@@ -1332,6 +1332,7 @@ AttentionBlockOutputs GptModel::forwardAttentionBlock(const GptLayerInputs&     
         // [hidden_size] is passed here as the correct residual for the later add.
         // Skip pre_layernorm to avoid shape mismatch (gamma [H] vs hidden [2H])
         // and semantically incorrect double normalization.
+        // TODO(yyh): remove this log
         RTP_LLM_LOG_INFO("[Eagle3 attnBlock] layer=%d using Eagle3 residual path: "
                          "hidden=[%zu,%zu] residual=[%zu,%zu] (skip pre_layernorm)"
                          " qkv_w=[%zu,%zu] attn_out_buf=[%zu,%zu]",
@@ -1717,7 +1718,7 @@ GptModelOutputs GptModel::forwardPostLayers(rtp_llm::BufferPtr       input,
                     std::move(softmax_result)};
         }
 
-        {
+        {  // TODO(yyh): remove this log
             auto logits_t = Buffer2torchTensor(logits, false);
             auto max_vals = std::get<0>(logits_t.max(-1));
             auto argmax   = logits_t.argmax(-1);
@@ -1774,11 +1775,13 @@ GptModelOutputs GptModel::forward(const GptModelInputs& inputs) {
             if (dynamic_cast<Eagle3Model*>(this) == nullptr && device_props_.is_eagle3
                 && device_props_.eagle3_selected_layer.count(i) > 0) {
                 eagle3_selected_hidden.push_back(device_->clone({*layer_inputs.hidden, AllocationType::DEVICE}));
+                // TODO(yyh): remove this log
                 RTP_LLM_LOG_INFO("[Eagle3 collect] layer %d hidden shape=[%s]",
                                  i,
                                  torch::str(Buffer2torchTensor(layer_inputs.hidden, false).sizes()).c_str());
             }
         }
+        // TODO(yyh): remove this log
         RTP_LLM_LOG_INFO("[Eagle3 collect] total selected layers collected: %zu / %zu configured",
                          eagle3_selected_hidden.size(),
                          device_props_.eagle3_selected_layer.size());

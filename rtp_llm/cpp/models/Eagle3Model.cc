@@ -23,7 +23,7 @@ namespace rtp_llm {
 EmbeddingPostOutput Eagle3Model::embeddingPost(const rtp_llm::BufferPtr& hidden_states, const GptModelInputs& inputs) {
     DevicePerfWrapper wrapper(device_, "eagle3_embedding_post");
     auto              last_hidden_states = inputs.last_hidden_states;
-
+    // TODO(yyh): remove this log
     RTP_LLM_LOG_INFO("[Eagle3 embeddingPost] entry: hidden_states=[%zu,%zu] last_hidden_states=%s",
                      hidden_states->shape()[0],
                      hidden_states->shape()[1],
@@ -48,7 +48,7 @@ EmbeddingPostOutput Eagle3Model::embeddingPost(const rtp_llm::BufferPtr& hidden_
         RTP_LLM_FAIL("eagle3_input_norm | eagle3_fc_norm | eagle3_fc_proj doesn't exist");
         return {hidden_states, nullptr};
     }
-
+    // TODO(yyh): remove this log
     RTP_LLM_LOG_INFO(
         "[Eagle3 embeddingPost] last_hidden_states shape=%s fc_proj_kernel shape=%s",
         torch::str(Buffer2torchTensor(inputs.last_hidden_states, false).sizes()).c_str(),
@@ -93,7 +93,7 @@ EmbeddingPostOutput Eagle3Model::embeddingPost(const rtp_llm::BufferPtr& hidden_
     torch::Tensor cat_tensor      = torch::cat({input_norm_tensor, proj_norm_tensor}, -1);
     BufferPtr final_hidden_states = device_->clone({*rtp_llm::torchTensor2Buffer(cat_tensor), AllocationType::DEVICE});
 
-    {
+    {  // TODO(yyh): remove this log
         auto  proj_t         = rtp_llm::Buffer2torchTensor(*proj_last_hidden_states, false);
         float proj_norm_val  = proj_t.to(torch::kFloat32).norm().item<float>();
         float input_norm_val = input_norm_tensor.to(torch::kFloat32).norm().item<float>();
