@@ -268,6 +268,10 @@ std::unique_ptr<rtp_llm::Weights> WeightsConverter::createGptWeights(std::unique
 
     gpt_weights.linear_bias_slopes = mayCreateDenseWeights(*global_weight, W::linear_bias_slopes);
 
+    // Eagle3 reduced-vocab token-ID lookup tables (absent for standard models).
+    gpt_weights.eagle3_d2t = mayFindBuffer(*global_weight, W::eagle3_d2t);
+    gpt_weights.eagle3_t2d = mayFindBuffer(*global_weight, W::eagle3_t2d);
+
     for (auto& layer_weights : layers_weights) {
         rtp_llm::LayerWeights layer_ws;
         layer_ws.pre_layernorm =

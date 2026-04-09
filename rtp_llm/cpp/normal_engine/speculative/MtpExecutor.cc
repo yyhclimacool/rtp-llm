@@ -1,4 +1,5 @@
 #include "rtp_llm/cpp/models/MTPModel.h"
+#include "rtp_llm/cpp/models/Eagle3Model.h"
 #include "rtp_llm/cpp/normal_engine/speculative/MtpExecutor.h"
 #include "rtp_llm/cpp/engine_base/stream/GenerateStream.h"
 #include "rtp_llm/cpp/engine_base/EngineBase.h"
@@ -21,6 +22,7 @@
 #include <memory>
 #include <thread>
 #include <random>
+#include <utility>
 
 namespace rtp_llm {
 
@@ -209,6 +211,17 @@ MtpExecutor::MtpExecutor(const EngineInitParams&                        params,
     LogitsProcessorFactory::init(params.model_config_.ckpt_path, params.sp_config.tree_decode_config);
 
     for (auto& mtp_params : *propose_params->mtp_model_params_) {
+        // Extract Eagle3 d2t/t2d buffers before creating the model (move semantics
+        // inside GptModelInitParams may invalidate the reference otherwise).
+        eagle3_d2t_ = mtp_params->gpt_weights.eagle3_d2t;
+        eagle3_t2d_ = mtp_params->gpt_weights.eagle3_t2d;
+        if (eagle3_d2t_) {
+            RTP_LLM_LOG_INFO("[Eagle3] d2t table loaded: %zu draft tokens -> target vocab", eagle3_d2t_->shape()[0]);
+        }
+        if (eagle3_t2d_) {
+            RTP_LLM_LOG_INFO("[Eagle3] t2d table loaded: %zu target tokens mapped", eagle3_t2d_->shape()[0]);
+        }
+
         auto model_params =
             GptModelInitParams({device_,
                                 mtp_params->gpt_weights,
@@ -222,8 +235,11 @@ MtpExecutor::MtpExecutor(const EngineInitParams&                        params,
             RTP_LLM_LOG_INFO("[speculative decoding] using py model");
             draft_model_.reset(new PyWrappedModel(
                 model_params, params.py_sp_model, false, false, draft_cache_layer_layout.layer_to_groups));
+        } else if (propose_params->sp_type == SP_TYPE_EAGLE3) {
+            RTP_LLM_LOG_INFO("[speculative decoding] Eagle3 c++ model");
+            draft_model_.reset(new Eagle3Model(model_params));
         } else {
-            RTP_LLM_LOG_INFO("[speculative decoding] legacy c++ gpt model");
+            RTP_LLM_LOG_INFO("[speculative decoding] legacy c++ mtp model");
             draft_model_.reset(new MTPModel(model_params));
         }
         break;  // NOTE: only support one mtp model now
@@ -377,12 +393,29 @@ absl::Status MtpExecutor::prefillStep(const std::list<GenerateStreamPtr>& stream
         return absl::OkStatus();
     }
 
-    // draft model sample
+    // draft model sample (prefill)
     {
         RTP_LLM_PROFILE_SCOPE("executor.mtp.prefill_step(draft_model_sample)");
-        fast_topk_sampler_output = fast_topk_sampler_->forward(Buffer2torchTensor(*draft_model_output.logits, false));
-        draft_sampler_output.all_probs = torchTensor2Buffer(fast_topk_sampler_output.all_probs);
-        draft_sampler_output.token_ids = torchTensor2Buffer(fast_topk_sampler_output.token_ids);
+        auto fast_topk_sampler_output =
+            fast_topk_sampler_->forward(Buffer2torchTensor(*draft_model_output.logits, false));
+        auto [mapped_probs, mapped_ids] =
+            mapDraftToTarget(fast_topk_sampler_output.all_probs, fast_topk_sampler_output.token_ids);
+        draft_sampler_output.all_probs = torchTensor2Buffer(mapped_probs);
+        draft_sampler_output.token_ids = torchTensor2Buffer(mapped_ids);
+
+        {
+            auto        ids_cpu = mapped_ids.to(torch::kCPU).to(torch::kInt32).contiguous();
+            int         n       = ids_cpu.numel();
+            std::string s;
+            for (int j = 0; j < std::min(n, 16); j++) {
+                if (j)
+                    s += ",";
+                s += std::to_string(ids_cpu.data_ptr<int>()[j]);
+            }
+            if (n > 16)
+                s += "...";
+            RTP_LLM_LOG_INFO("[SP trace] prefill draft token(s): [%s] (n=%d)", s.c_str(), n);
+        }
     }
 
     // collect metrics
@@ -550,14 +583,29 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
 
     {
         RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(prepare_decode_input_and_tp_sync)");
+        RTP_LLM_LOG_INFO("[Eagle3 diag] decodeStep BEFORE prepare: last_hidden_states=%s isTpRank0=%d propose_step=%zu",
+                         model_input.last_hidden_states ?
+                             (std::string("[") + std::to_string(model_input.last_hidden_states->shape()[0]) + ","
+                              + std::to_string(model_input.last_hidden_states->shape()[1]) + "]")
+                                 .c_str() :
+                             "nullptr",
+                         isTpRank0() ? 1 : 0,
+                         propose_step_);
         if (isTpRank0()) {
             if (propose_step_ == 1) {
                 batch_stream_processor_->prepareOneStepSpecDecodeModelInput(stream_groups, model_input);
             } else {
                 batch_stream_processor_->prepareDecodeDraftModelInput(stream_groups, model_input);
+                // For Eagle3, gatherHiddenStates now returns the main model's [N, 7680]
+                // merged auxiliary hidden states (stored in sp_output_buffer), which is
+                // exactly what Eagle3Model::embeddingPost fc_proj expects.
             }
         }
+        RTP_LLM_LOG_INFO("[Eagle3 diag] decodeStep AFTER prepare: last_hidden_states=%s",
+                         model_input.last_hidden_states ? "NON-NULL" : "nullptr");
         tpSyncModelInputs(model_input, device_);
+        RTP_LLM_LOG_INFO("[Eagle3 diag] decodeStep AFTER tpSync: last_hidden_states=%s",
+                         model_input.last_hidden_states ? "NON-NULL" : "nullptr");
         if (model_input.skip_run) {
             return absl::OkStatus();
         }
@@ -574,6 +622,21 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
 
     {
         RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(target_model_verify)");
+        if (isTpRank0() && model_input.combo_tokens) {
+            auto combo_cpu =
+                Buffer2torchTensor(model_input.combo_tokens, false).to(torch::kCPU).to(torch::kInt32).contiguous();
+            int         n = combo_cpu.numel();
+            auto*       p = combo_cpu.data_ptr<int>();
+            std::string s;
+            for (int j = 0; j < std::min(n, 32); j++) {
+                if (j)
+                    s += ",";
+                s += std::to_string(p[j]);
+            }
+            if (n > 32)
+                s += "...";
+            RTP_LLM_LOG_INFO("[SP trace] target VERIFY input combo_tokens: [%s] (n=%d)", s.c_str(), n);
+        }
         maybePrintModelInput(model_input, "decode target model");
         model_input.is_target_verify        = true;
         model_input.kv_cache_layer_to_group = target_kv_cache_layer_to_group;
@@ -626,11 +689,42 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
 
             // rejection sampling
             speculative_sampler_output = speculative_sampler_->forward(streams, draft_sampler_output, sampler_output);
+
+            for (size_t b = 0; b < speculative_sampler_output.accept_len.size() && b < 4; b++) {
+                int         accept_n = speculative_sampler_output.accept_len[b];
+                auto*       atp      = speculative_sampler_output.accept_tokens[b]->data<int>();
+                std::string accepted_s;
+                for (int j = 0; j < accept_n; j++) {
+                    if (j)
+                        accepted_s += ",";
+                    accepted_s += std::to_string(atp[j]);
+                }
+                // draft_token_ids_t shape: [batch, propose_step_+1]
+                std::string draft_s;
+                if (draft_token_ids_t.defined()) {
+                    auto row = draft_token_ids_t.to(torch::kCPU).to(torch::kInt32).contiguous();
+                    for (int k = 0; k < (int)(propose_step_ + 1); k++) {
+                        if (k)
+                            draft_s += ",";
+                        draft_s += std::to_string(row[(int)b][k].item<int>());
+                    }
+                }
+                RTP_LLM_LOG_INFO("[SP trace] batch[%zu] accept_len=%d/%zu  draft=[%s]  accepted=[%s]",
+                                 b,
+                                 accept_n,
+                                 propose_step_,
+                                 draft_s.c_str(),
+                                 accepted_s.c_str());
+            }
         }
         // NOTE: here will have cuda device sync before update model input
         batch_stream_processor_->updateDecodePostDraftModelInput(
             model_input, model_output, speculative_sampler_output, batch_size, hidden_states_d_t, total_accept_len);
     }
+
+    // For Eagle3 dispatch: save the main model's [total_accept_len, 7680] hidden states
+    // before draft prefill forward potentially overwrites model_input.last_hidden_states.
+    BufferPtr main_model_hidden_for_dispatch = eagle3_d2t_ ? model_input.last_hidden_states : nullptr;
 
     {
         RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(tp_sync_post_rejection)");
@@ -657,13 +751,29 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
         return absl::OkStatus();
     }
 
-    // draft model sample
+    // draft model sample (post-verify prefill) – remap to target vocab if needed
     {
         RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(draft_model_sample)");
-        fast_topk_sampler_output =
+        auto fast_topk_sampler_output =
             fast_topk_sampler_->forward(Buffer2torchTensor(*draft_prefill_model_output.logits, false));
-        draft_prefill_sampler_output.all_probs = torchTensor2Buffer(fast_topk_sampler_output.all_probs);
-        draft_prefill_sampler_output.token_ids = torchTensor2Buffer(fast_topk_sampler_output.token_ids);
+        auto [mapped_probs, mapped_ids] =
+            mapDraftToTarget(fast_topk_sampler_output.all_probs, fast_topk_sampler_output.token_ids);
+        draft_prefill_sampler_output.all_probs = torchTensor2Buffer(mapped_probs);
+        draft_prefill_sampler_output.token_ids = torchTensor2Buffer(mapped_ids);
+
+        {
+            auto        ids_cpu = mapped_ids.to(torch::kCPU).to(torch::kInt32).contiguous();
+            int         n       = ids_cpu.numel();
+            std::string s;
+            for (int j = 0; j < std::min(n, 16); j++) {
+                if (j)
+                    s += ",";
+                s += std::to_string(ids_cpu.data_ptr<int>()[j]);
+            }
+            if (n > 16)
+                s += "...";
+            RTP_LLM_LOG_INFO("[SP trace] post-verify draft token(s): [%s] (n=%d)", s.c_str(), n);
+        }
     }
 
     // collect metrics
@@ -691,7 +801,8 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
         auto result = batch_stream_processor_->dispatchDecode(
             stream_groups,
             speculative_sampler_output,
-            {std::move(draft_prefill_model_output), std::move(draft_prefill_sampler_output)});
+            {std::move(draft_prefill_model_output), std::move(draft_prefill_sampler_output)},
+            main_model_hidden_for_dispatch);
         // clean holder tensors from grpc
         for (auto& stream : streams) {
             stream->getSPOutputBuffer()->tensors_holder.clear();
@@ -827,25 +938,58 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
     auto pre_propose_token_t_reshape = pre_propose_token_t.reshape({(int)batch_size, 1});
     draft_token_ids_list.push_back(pre_propose_token_t_reshape);
 
+    RTP_LLM_LOG_INFO("[Eagle3 diag] draftModelDecode ENTER: propose_step=%zu last_hidden_states=%s",
+                     propose_step_,
+                     model_input.last_hidden_states ?
+                         (std::string("[") + std::to_string(model_input.last_hidden_states->shape()[0]) + ","
+                          + std::to_string(model_input.last_hidden_states->shape()[1]) + "]")
+                             .c_str() :
+                         "nullptr");
+
     // n-1 steps draft model decode
     for (int i = 0; i < propose_step_ - 1; i++) {
         RTP_LLM_PROFILE_SCOPE_DYNAMIC("executor.mtp.draft_model_decode(loop_iter=%d)", i);
-        RTP_LLM_LOG_DEBUG("draft model decode step %d batch_size %d", i, batch_size);
+        RTP_LLM_LOG_INFO("[Eagle3 diag] draftModelDecode iter=%d/%zu last_hidden_states=%s",
+                         i,
+                         propose_step_ - 1,
+                         model_input.last_hidden_states ?
+                             (std::string("[") + std::to_string(model_input.last_hidden_states->shape()[0]) + ","
+                              + std::to_string(model_input.last_hidden_states->shape()[1]) + "]")
+                                 .c_str() :
+                             "nullptr");
         draft_decode_model_output = std::move(draft_model_->forward(model_input));
 
-        // sample
+        // sample and remap draft vocab → target vocab if eagle3_d2t_ is available
         auto fast_topk_sampler_output =
             fast_topk_sampler_->forward(Buffer2torchTensor(*draft_decode_model_output.logits, false), 1);
-        auto draft_probs         = fast_topk_sampler_output.all_probs;
-        auto draft_probs_reshape = draft_probs.reshape({(int)batch_size, 1, -1});
-        auto draft_token_ids     = fast_topk_sampler_output.token_ids;
+        auto draft_token_ids = fast_topk_sampler_output.token_ids;
+        auto draft_probs     = fast_topk_sampler_output.all_probs;
 
         if (model_input.is_fake_stream) {
             draft_token_ids.zero_();
             device_->bufMemset(*draft_decode_model_output.all_hidden_states, 0);
         }
 
-        draft_token_ids = draft_token_ids.to(torch::kInt32);
+        // Apply d2t: convert token IDs and expand probs to target vocab space.
+        auto [mapped_probs, mapped_ids] = mapDraftToTarget(draft_probs, draft_token_ids);
+        draft_token_ids                 = mapped_ids.to(torch::kInt32);
+        // Reshape probs to [batch, 1, vocab] for later cat.
+        auto draft_probs_reshape = mapped_probs.reshape({(int)batch_size, 1, -1});
+
+        {
+            auto        ids_cpu = draft_token_ids.to(torch::kCPU).contiguous();
+            int         n       = ids_cpu.numel();
+            std::string s;
+            for (int j = 0; j < std::min(n, 16); j++) {
+                if (j)
+                    s += ",";
+                s += std::to_string(ids_cpu.data_ptr<int>()[j]);
+            }
+            if (n > 16)
+                s += "...";
+            RTP_LLM_LOG_INFO("[SP trace] draftDecode iter=%d draft token(s): [%s] (n=%d)", i, s.c_str(), n);
+        }
+
         draft_token_ids_list.push_back(draft_token_ids);
         draft_probs_list.push_back(draft_probs_reshape);
 
@@ -853,6 +997,13 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
         if (i != propose_step_ - 2) {
             batch_stream_processor_->updateDecodeDraftModelInput(
                 model_input, draft_decode_model_output, draft_token_ids);
+            // Eagle3: step 0 used the main model's [N, 7680] auxiliary hidden states from
+            // sp_output_buffer. The draft model's own output has different dimensions and
+            // cannot be fed back into fc_proj. Reset to nullptr so Eagle3Model::embeddingPost
+            // uses the "duplicate" path (cat [embed, embed]) for subsequent draft steps.
+            if (eagle3_d2t_) {
+                model_input.last_hidden_states = nullptr;
+            }
         }
     }
 
@@ -861,6 +1012,23 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
         // prepare spec decode input
         draft_token_ids_t =
             torch::cat(draft_token_ids_list, 1).reshape({(int)batch_size, (int)(propose_step_ + 1)}).contiguous();
+
+        {
+            auto ids_cpu = draft_token_ids_t.to(torch::kCPU).to(torch::kInt32).contiguous();
+            for (int b = 0; b < (int)batch_size && b < 4; b++) {
+                std::string s;
+                for (int k = 0; k < (int)(propose_step_ + 1); k++) {
+                    if (k)
+                        s += ",";
+                    s += std::to_string(ids_cpu[b][k].item<int>());
+                }
+                RTP_LLM_LOG_INFO(
+                    "[SP trace] draft ALL tokens batch[%d]: [%s] (target_token, propose_token, draft_0..%zu)",
+                    b,
+                    s.c_str(),
+                    propose_step_ - 2);
+            }
+        }
 
         auto lm_output_indexes = device_->allocateBuffer(
             {rtp_llm::DataType::TYPE_INT32, {batch_size * (propose_step_ + 1)}, rtp_llm::AllocationType::HOST}, {});
@@ -888,6 +1056,77 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
         const auto& cache_cfg             = cache_manager_->cacheConfig();
         model_input.kv_block_stride_bytes = cache_cfg.kv_block_stride_bytes;
     }
+}
+
+std::pair<torch::Tensor, torch::Tensor> MtpExecutor::mapDraftToTarget(const torch::Tensor& draft_all_probs,
+                                                                      const torch::Tensor& draft_token_ids) const {
+    if (!eagle3_d2t_) {
+        return {draft_all_probs, draft_token_ids};
+    }
+
+    // d2t lookup table: [draft_vocab_size] values, on device.
+    // We need int64 indices for torch gather/scatter/index_select.
+    auto d2t_raw = Buffer2torchTensor(*eagle3_d2t_, false);
+    auto d2t_t   = d2t_raw.to(torch::kInt64);  // [D]
+
+    // ── Map token IDs: draft vocab → target vocab ────────────────────────
+    auto orig_ids_shape = draft_token_ids.sizes().vec();
+    auto flat_ids       = draft_token_ids.to(torch::kInt64).flatten();  // [N]
+
+    // Safety: clamp flat_ids into valid d2t range to avoid index_select OOB.
+    auto d2t_size   = d2t_t.size(0);
+    auto flat_ids_c = flat_ids.clamp(0, d2t_size - 1);
+    auto target_ids = d2t_t
+                          .index_select(0, flat_ids_c)  // [N]
+                          .reshape(orig_ids_shape)
+                          .to(torch::kInt32);
+
+    // ── Expand probabilities: [..., draft_vocab] → [..., target_vocab] ──
+    // Build the index tensor by broadcasting d2t across the batch dims.
+    auto    probs_shape  = draft_all_probs.sizes().vec();  // e.g. [batch, draft_vocab]
+    int64_t draft_vocab  = probs_shape.back();
+    int64_t target_vocab = static_cast<int64_t>(vocab_size_);
+    auto    target_shape = probs_shape;
+    target_shape.back()  = target_vocab;
+
+    // NOTE: c10::TypeMeta::name() returns c10::string_view (16-byte struct), NOT const char*.
+    // Passing string_view directly to snprintf %s causes ABI mismatch and SIGSEGV.
+    // Convert to std::string first to get a proper const char*.
+    const std::string d2t_dtype_str(d2t_t.dtype().name());
+    const std::string raw_dtype_str(d2t_raw.dtype().name());
+    const std::string probs_shape_str = torch::str(draft_all_probs.sizes());
+    RTP_LLM_LOG_INFO("[Eagle3 d2t] d2t dtype=%s shape=[%ld] raw_dtype=%s "
+                     "all_probs=%s draft_vocab=%ld target_vocab=%ld vocab_size_=%zu",
+                     d2t_dtype_str.c_str(),
+                     d2t_size,
+                     raw_dtype_str.c_str(),
+                     probs_shape_str.c_str(),
+                     draft_vocab,
+                     target_vocab,
+                     vocab_size_);
+
+    if (target_vocab <= 0) {
+        RTP_LLM_LOG_WARNING("[Eagle3 d2t] target_vocab <= 0, skip prob expansion");
+        return {draft_all_probs, target_ids};
+    }
+
+    // idx: same shape as draft_all_probs, each row = d2t indices, contiguous for scatter_.
+    std::vector<int64_t> expand_shape(probs_shape.size(), 1);
+    expand_shape.back() = draft_vocab;
+    // .contiguous() ensures the CUDA scatter_ kernel sees a dense index tensor.
+    auto d2t_row = d2t_t.reshape(expand_shape).expand(probs_shape).contiguous();
+
+    // Clamp indices into [0, target_vocab-1] as a safety guard.
+    d2t_row.clamp_(0, target_vocab - 1);
+
+    auto expanded_probs = torch::zeros(target_shape, draft_all_probs.options());
+    expanded_probs.scatter_(-1, d2t_row, draft_all_probs);
+
+    RTP_LLM_LOG_DEBUG("[Eagle3 d2t] probs [%s] -> [%s]",
+                      torch::str(draft_all_probs.sizes()).c_str(),
+                      torch::str(expanded_probs.sizes()).c_str());
+
+    return {expanded_probs, target_ids};
 }
 
 }  // namespace rtp_llm

@@ -97,13 +97,21 @@ Allocator<AllocatorType::CUDA>::~Allocator() {
 
 void* Allocator<AllocatorType::CUDA>::doMalloc(size_t size) {
     void* ptr = nullptr;
-    check_cuda_value(cudaMalloc(&ptr, (size_t)(ceil(size / 128.)) * 128));
+    auto  err = cudaMalloc(&ptr, (size_t)(ceil(size / 128.)) * 128);
+    if (err != cudaSuccess) {
+        cudaGetLastError();  // Clear sticky error before throwing (same rationale as HOST allocator)
+        check_cuda_value(err);
+    }
     return ptr;
 }
 
 void* Allocator<AllocatorType::CUDA>::doMallocSync(size_t size) {
     void* ptr = nullptr;
-    check_cuda_value(cudaMalloc(&ptr, (size_t)(ceil(size / 128.)) * 128));
+    auto  err = cudaMalloc(&ptr, (size_t)(ceil(size / 128.)) * 128);
+    if (err != cudaSuccess) {
+        cudaGetLastError();
+        check_cuda_value(err);
+    }
     return ptr;
 }
 
@@ -123,7 +131,17 @@ Allocator<AllocatorType::CUDA_HOST>::~Allocator() {
 
 void* Allocator<AllocatorType::CUDA_HOST>::doMalloc(size_t size) {
     void* ptr = nullptr;
-    check_cuda_value(cudaMallocHost(&ptr, (size_t)(ceil(size / 128.)) * 128));
+    auto  err = cudaMallocHost(&ptr, (size_t)(ceil(size / 128.)) * 128);
+    if (err != cudaSuccess) {
+        // Clear the sticky CUDA error before throwing so that subsequent unrelated
+        // CUDA error checks (e.g. cudaPeekAtLastError after a kernel launch) are not
+        // poisoned by this allocation failure.  This matters when TrackerAllocator
+        // binary-searches for the largest allocatable HOST block: each failed attempt
+        // would otherwise leave a sticky error that later causes a false positive in
+        // embedding_kernels.cu or other kernel error checks.
+        cudaGetLastError();
+        check_cuda_value(err);
+    }
     return ptr;
 }
 

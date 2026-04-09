@@ -38,13 +38,13 @@ def create_engine(
     torch.ops.rtp_llm.init_engine(alog_conf_path)
 
     if model.model_config.task_type == TaskType.LANGUAGE_MODEL:
+        logging.info("create llm engine")
         return LanguageCppEngine(
             model=model,
             engine_config=engine_config,
             world_info=world_info,
             propose_model=propose_model,
         )
-        logging.info("create llm engine")
     else:
         logging.info("create embedding engine")
         return EmbeddingCppEngine(model, engine_config)
