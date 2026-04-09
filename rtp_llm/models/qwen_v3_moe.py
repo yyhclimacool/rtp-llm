@@ -1,4 +1,5 @@
 import functools
+import logging
 from typing import TYPE_CHECKING, Any, List, Optional
 
 import torch
@@ -29,6 +30,26 @@ from rtp_llm.utils.model_weight import (
     transpose_pad,
     zeros,
 )
+
+logger = logging.getLogger(__name__)
+
+
+def _reconstruct_d2t_from_t2d(ts: List[torch.Tensor]) -> torch.Tensor:
+    """Reconstruct the d2t (draft→target) index array from the t2d boolean mask.
+
+    SpecForge checkpoints may save a corrupted d2t where identity-mapped entries
+    (the first N positions) are all zero instead of [0, 1, 2, ..., N-1].
+    Reconstructing from t2d is always correct because t2d is the ground truth:
+        d2t = sorted indices where t2d is True
+    """
+    t2d = ts[0]
+    d2t = torch.where(t2d.bool())[0]
+    logger.info(
+        "Reconstructed d2t from t2d: %d draft tokens mapped from %d target vocab",
+        d2t.shape[0],
+        t2d.shape[0],
+    )
+    return d2t
 
 
 class QWenV3MoeWeight(QWenV2MoeWeight):
@@ -162,6 +183,13 @@ class Qwen3MoeEagle3Weight(QWenV2Weight):
         assert self._num_layers == 1
         for layer in range(self._num_layers):
             layer_weights_tmp = self._get_hf_layer_weight_info(layer)
+            # Eagle3 embeddingPost already applies norms before concatenation.
+            # Remove pre_ln_gamma to avoid shape mismatch (gamma [H] vs hidden [2H]).
+            layer_weights_tmp = [
+                w
+                for w in layer_weights_tmp
+                if getattr(w, "name", None) != W.pre_ln_gamma
+            ]
             layer_weights_tmp.extend(
                 [
                     AtomicWeight(
@@ -279,18 +307,17 @@ class SpecforgeLlamaEagle3Weight(QWenV2Weight):
             ),
             # Draft-to-target token ID mapping (1-D int32 lookup table).
             # d2t[draft_token] -> target_token  shape: [draft_vocab_size]
-            # Used by MtpExecutor to remap draft logits/tokens to target vocab space
-            # after each specforge Eagle3 sampling step.
-            # data_type=torch.int32: preserve exact integer values (avoid bf16 precision loss).
+            # Reconstructed from the t2d boolean mask to avoid corrupted d2t
+            # values in SpecForge checkpoints (identity-mapped positions saved as
+            # all-zero).  data_type=torch.int32 preserves exact integer values.
             AtomicWeight(
                 W.eagle3_d2t,
-                [CkptWeightInfo("d2t", identity)],
-                identity,
+                [CkptWeightInfo("t2d", identity)],
+                _reconstruct_d2t_from_t2d,
                 data_type=torch.int32,
             ),
-            # Target-to-draft mapping (stored for completeness; not applied at runtime
-            # because the draft model reuses the main model's full embed_tokens table).
-            # t2d[target_token] -> draft_token   shape: [target_vocab_size], -1 if absent
+            # Target-to-draft boolean mask (t2d[target_token] = True if in draft vocab).
+            # Not used at runtime; kept for checkpoint compatibility.
             AtomicWeight(
                 W.eagle3_t2d,
                 [CkptWeightInfo("t2d", identity)],
@@ -303,15 +330,11 @@ class SpecforgeLlamaEagle3Weight(QWenV2Weight):
     def _get_specforge_layer_weight_info(self) -> List[WeightModule]:
         """Build weight descriptors for the single 'midlayer' transformer block.
 
-        Notes on the double-use of midlayer.input_layernorm.weight:
-          - pre_ln_gamma      : applied inside GptLayer's standard attention path
-                                (line 1322-1350 of GptModel.cc).  The input at
-                                that point is cat(input_norm, fc_norm) [2*hidden],
-                                so this weight acts on the already-normed concat.
-          - eagle3_input_norm : applied in Eagle3Model::embeddingPost on the raw
-                                token embedding [hidden] before the concat.
-          Both slots share the identical tensor, matching how Qwen3MoeEagle3Weight
-          maps model.layers.0.input_layernorm.weight to both roles.
+        Eagle3 embeddingPost already applies hidden_norm and input_layernorm
+        before concatenation, so the standard pre-attention layernorm slot
+        (pre_ln_gamma) is intentionally NOT loaded here.  Loading it would
+        cause a shape mismatch: gamma [hidden_size] applied to the
+        concatenated hidden [2*hidden_size] inside forwardAttentionBlock.
         """
         attn_config = AttnConfig(
             hidden_size=self._hidden_size,
@@ -326,17 +349,9 @@ class SpecforgeLlamaEagle3Weight(QWenV2Weight):
         )
         align_size = self._align_size
 
-        # midlayer.input_layernorm is shared between pre_ln_gamma and
-        # eagle3_input_norm_gamma (see docstring above).
         input_ln_key = "midlayer.input_layernorm.weight"
 
         return [
-            # ── Standard pre-attention layernorm slot ──────────────────────
-            AtomicWeight(
-                W.pre_ln_gamma,
-                [CkptWeightInfo(input_ln_key, identity)],
-                identity,
-            ),
             # ── Attention ─────────────────────────────────────────────────
             # q/k/v input dimension is 2*hidden (cat of normed_emb + normed_fc).
             # No qk_norm (Llama-style).
@@ -400,7 +415,6 @@ class SpecforgeLlamaEagle3Weight(QWenV2Weight):
                 identity,
             ),
             # Norm applied to the token embedding in embeddingPost.
-            # Shares the same underlying tensor as pre_ln_gamma (see docstring).
             AtomicWeight(
                 W.eagle3_input_norm_gamma,
                 [CkptWeightInfo(input_ln_key, identity)],

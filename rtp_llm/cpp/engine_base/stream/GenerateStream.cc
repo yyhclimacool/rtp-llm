@@ -82,8 +82,7 @@ GenerateStream::GenerateStream(const shared_ptr<GenerateInput>& input,
         device_->allocateBuffer({rtp_llm::DataType::TYPE_FP32, {init_batch_size}, rtp_llm::AllocationType::HOST}, {});
     memset(cum_log_probs_->data(), 0, cum_log_probs_->sizeBytes());
 
-    is_context_stream_       = std::make_shared<bool>();
-    *is_context_stream_      = true;
+    is_context_stream_       = std::make_shared<bool>(true);
     generate_status_         = std::make_shared<GenerateStatus>();
     generate_status_->status = StreamState::WAITING;
     sub_generate_status_.clear();

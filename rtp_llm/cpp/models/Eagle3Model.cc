@@ -24,8 +24,16 @@ EmbeddingPostOutput Eagle3Model::embeddingPost(const rtp_llm::BufferPtr& hidden_
     DevicePerfWrapper wrapper(device_, "eagle3_embedding_post");
     auto              last_hidden_states = inputs.last_hidden_states;
 
+    RTP_LLM_LOG_INFO("[Eagle3 embeddingPost] entry: hidden_states=[%zu,%zu] last_hidden_states=%s",
+                     hidden_states->shape()[0],
+                     hidden_states->shape()[1],
+                     last_hidden_states ? (std::string("[") + std::to_string(last_hidden_states->shape()[0]) + ","
+                                           + std::to_string(last_hidden_states->shape()[1]) + "]")
+                                              .c_str() :
+                                          "nullptr");
+
     if (last_hidden_states == nullptr) {
-        RTP_LLM_LOG_DEBUG("last hidden states is null in eagle3 model");
+        RTP_LLM_LOG_WARNING("[Eagle3 embeddingPost] FALLBACK: last_hidden_states is null, using duplicate path");
         // For eagle3, attention q_proj is (2 * hidden_size -> hidden_size), thereforce we need to duplicate hidden
         // states here
         BufferPtr duplicate_hidden = device_->clone(
@@ -85,7 +93,18 @@ EmbeddingPostOutput Eagle3Model::embeddingPost(const rtp_llm::BufferPtr& hidden_
     torch::Tensor cat_tensor      = torch::cat({input_norm_tensor, proj_norm_tensor}, -1);
     BufferPtr final_hidden_states = device_->clone({*rtp_llm::torchTensor2Buffer(cat_tensor), AllocationType::DEVICE});
 
-    // printBufferData(*final_hidden_states, "final_hidden_states");
+    {
+        auto  proj_t         = rtp_llm::Buffer2torchTensor(*proj_last_hidden_states, false);
+        float proj_norm_val  = proj_t.to(torch::kFloat32).norm().item<float>();
+        float input_norm_val = input_norm_tensor.to(torch::kFloat32).norm().item<float>();
+        float proj_n_val     = proj_norm_tensor.to(torch::kFloat32).norm().item<float>();
+        float cat_norm_val   = cat_tensor.to(torch::kFloat32).norm().item<float>();
+        RTP_LLM_LOG_INFO("[Eagle3 embeddingPost] norms: proj=%.4f input_norm=%.4f proj_norm=%.4f cat=%.4f",
+                         proj_norm_val,
+                         input_norm_val,
+                         proj_n_val,
+                         cat_norm_val);
+    }
     return {final_hidden_states, proj_last_hidden_states};
 }
 

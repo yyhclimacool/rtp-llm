@@ -239,7 +239,7 @@ MtpExecutor::MtpExecutor(const EngineInitParams&                        params,
             RTP_LLM_LOG_INFO("[speculative decoding] Eagle3 c++ model");
             draft_model_.reset(new Eagle3Model(model_params));
         } else {
-            RTP_LLM_LOG_INFO("[speculative decoding] legacy c++ gpt model");
+            RTP_LLM_LOG_INFO("[speculative decoding] legacy c++ mtp model");
             draft_model_.reset(new MTPModel(model_params));
         }
         break;  // NOTE: only support one mtp model now
