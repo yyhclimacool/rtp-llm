@@ -48,14 +48,28 @@ EmbeddingPostOutput Eagle3Model::embeddingPost(const rtp_llm::BufferPtr& hidden_
         RTP_LLM_FAIL("eagle3_input_norm | eagle3_fc_norm | eagle3_fc_proj doesn't exist");
         return {hidden_states, nullptr};
     }
-    // TODO(yyh): remove this log
-    RTP_LLM_LOG_INFO(
-        "[Eagle3 embeddingPost] last_hidden_states shape=%s fc_proj_kernel shape=%s",
-        torch::str(Buffer2torchTensor(inputs.last_hidden_states, false).sizes()).c_str(),
-        torch::str(Buffer2torchTensor(*(weights_.layers[0].eagle3_fc_proj->kernel), false).sizes()).c_str());
 
-    auto proj_last_hidden_states =
-        device_->gemm({*inputs.last_hidden_states, *(weights_.layers[0].eagle3_fc_proj->kernel)});
+    size_t last_hidden_dim = last_hidden_states->shape()[1];
+    size_t fc_proj_in_dim  = weights_.layers[0].eagle3_fc_proj->kernel->shape()[0];
+    bool   need_proj       = (last_hidden_dim == fc_proj_in_dim);
+
+    // TODO(yyh): remove this log
+    RTP_LLM_LOG_INFO("[Eagle3 embeddingPost] last_hidden=[%zu,%zu] fc_proj=[%zu,%zu] need_proj=%d",
+                     last_hidden_states->shape()[0],
+                     last_hidden_dim,
+                     fc_proj_in_dim,
+                     weights_.layers[0].eagle3_fc_proj->kernel->shape()[1],
+                     (int)need_proj);
+
+    BufferPtr proj_last_hidden_states;
+    if (need_proj) {
+        // Step 0: main model merged hidden states [T, 3*H] → fc_proj → [T, H]
+        proj_last_hidden_states =
+            device_->gemm({*inputs.last_hidden_states, *(weights_.layers[0].eagle3_fc_proj->kernel)});
+    } else {
+        // Step 1+: draft model's own hidden states [T, H] → skip fc_proj
+        proj_last_hidden_states = last_hidden_states;
+    }
     printBufferData(*proj_last_hidden_states, "proj_last_hidden_states");
 
     auto proj_norm = device_->layernorm(LayernormParams(proj_last_hidden_states,

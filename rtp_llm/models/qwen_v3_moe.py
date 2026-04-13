@@ -1,5 +1,4 @@
 import functools
-import logging
 from typing import TYPE_CHECKING, Any, List, Optional
 
 import torch
@@ -30,26 +29,6 @@ from rtp_llm.utils.model_weight import (
     transpose_pad,
     zeros,
 )
-
-logger = logging.getLogger(__name__)
-
-
-def _reconstruct_d2t_from_t2d(ts: List[torch.Tensor]) -> torch.Tensor:
-    """Reconstruct the d2t (draft→target) index array from the t2d boolean mask.
-
-    SpecForge checkpoints may save a corrupted d2t where identity-mapped entries
-    (the first N positions) are all zero instead of [0, 1, 2, ..., N-1].
-    Reconstructing from t2d is always correct because t2d is the ground truth:
-        d2t = sorted indices where t2d is True
-    """
-    t2d = ts[0]
-    d2t = torch.where(t2d.bool())[0]
-    logger.info(
-        "Reconstructed d2t from t2d: %d draft tokens mapped from %d target vocab",
-        d2t.shape[0],
-        t2d.shape[0],
-    )
-    return d2t
 
 
 class QWenV3MoeWeight(QWenV2MoeWeight):
@@ -305,15 +284,12 @@ class SpecforgeLlamaEagle3Weight(QWenV2Weight):
                 [],
                 functools.partial(zeros, shape=[self._hidden_size]),
             ),
-            # Draft-to-target token ID mapping (1-D int32 lookup table).
-            # d2t[draft_token] -> target_token  shape: [draft_vocab_size]
-            # Reconstructed from the t2d boolean mask to avoid corrupted d2t
-            # values in SpecForge checkpoints (identity-mapped positions saved as
-            # all-zero).  data_type=torch.int32 preserves exact integer values.
+            # Differentially-encoded draft→target mapping: d2t[i] = target_id - i.
+            # The C++ MtpExecutor::mapDraftToTarget decodes it at runtime.
             AtomicWeight(
                 W.eagle3_d2t,
-                [CkptWeightInfo("t2d", identity)],
-                _reconstruct_d2t_from_t2d,
+                [CkptWeightInfo("d2t", identity)],
+                identity,
                 data_type=torch.int32,
             ),
             # Target-to-draft boolean mask (t2d[target_token] = True if in draft vocab).

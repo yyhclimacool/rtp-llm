@@ -997,13 +997,10 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
         if (i != propose_step_ - 2) {
             batch_stream_processor_->updateDecodeDraftModelInput(
                 model_input, draft_decode_model_output, draft_token_ids);
-            // Eagle3: step 0 used the main model's [N, 7680] auxiliary hidden states from
-            // sp_output_buffer. The draft model's own output has different dimensions and
-            // cannot be fed back into fc_proj. Reset to nullptr so Eagle3Model::embeddingPost
-            // uses the "duplicate" path (cat [embed, embed]) for subsequent draft steps.
-            if (eagle3_d2t_) {
-                model_input.last_hidden_states = nullptr;
-            }
+            // Eagle3: step 0 used the main model's [N, 3*H] merged hidden states.
+            // For step 1+, updateDecodeDraftModelInput passes the draft model's own
+            // hidden states [N, H]. Eagle3Model::embeddingPost detects the dimension
+            // difference and skips fc_proj accordingly.
         }
     }
 
@@ -1064,16 +1061,16 @@ std::pair<torch::Tensor, torch::Tensor> MtpExecutor::mapDraftToTarget(const torc
         return {draft_all_probs, draft_token_ids};
     }
 
-    // d2t lookup table: [draft_vocab_size] values, on device.
-    // We need int64 indices for torch gather/scatter/index_select.
-    auto d2t_raw = Buffer2torchTensor(*eagle3_d2t_, false);
-    auto d2t_t   = d2t_raw.to(torch::kInt64);  // [D]
+    // d2t is differentially encoded: d2t_diff[i] = target_token_id - i
+    // Decode to direct mapping: d2t_direct[i] = d2t_diff[i] + i
+    auto d2t_raw  = Buffer2torchTensor(*eagle3_d2t_, false);
+    auto d2t_diff = d2t_raw.to(torch::kInt64);                                       // [D]
+    auto d2t_t    = d2t_diff + torch::arange(d2t_diff.size(0), d2t_diff.options());  // [D]
 
     // ── Map token IDs: draft vocab → target vocab ────────────────────────
     auto orig_ids_shape = draft_token_ids.sizes().vec();
     auto flat_ids       = draft_token_ids.to(torch::kInt64).flatten();  // [N]
 
-    // Safety: clamp flat_ids into valid d2t range to avoid index_select OOB.
     auto d2t_size   = d2t_t.size(0);
     auto flat_ids_c = flat_ids.clamp(0, d2t_size - 1);
     auto target_ids = d2t_t
