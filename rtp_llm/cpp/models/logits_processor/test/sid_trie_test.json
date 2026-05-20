@@ -1,0 +1,12 @@
+{
+    "end_token_id": 2,
+    "ads": [
+        {"ad_id": "ad_1001", "sid_path": [10, 20, 30]},
+        {"ad_id": "ad_1002", "sid_path": [10, 20, 31]},
+        {"ad_id": "ad_1003", "sid_path": [10, 21, 40]},
+        {"ad_id": "ad_1004", "sid_path": [11, 50, 60]},
+        {"ad_id": "ad_1005", "sid_path": [11, 50, 61]},
+        {"ad_id": "ad_1006", "sid_path": [11, 51, 70]},
+        {"ad_id": "ad_1007", "sid_path": [12, 60, 80]}
+    ]
+}

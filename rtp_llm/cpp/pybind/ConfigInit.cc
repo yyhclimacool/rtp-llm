@@ -685,6 +685,7 @@ PYBIND11_MODULE(libth_transformer_config, m) {
         .def_readwrite("sp_min_token_match", &SpeculativeExecutionConfig::sp_min_token_match)
         .def_readwrite("sp_max_token_match", &SpeculativeExecutionConfig::sp_max_token_match)
         .def_readwrite("tree_decode_config", &SpeculativeExecutionConfig::tree_decode_config)
+        .def_readwrite("sid_trie_config", &SpeculativeExecutionConfig::sid_trie_config)
         .def_readwrite("gen_num_per_cycle", &SpeculativeExecutionConfig::gen_num_per_cycle)
         .def_readwrite("force_stream_sample", &SpeculativeExecutionConfig::force_stream_sample)
         .def_readwrite("force_score_context_attention", &SpeculativeExecutionConfig::force_score_context_attention)
@@ -702,10 +703,11 @@ PYBIND11_MODULE(libth_transformer_config, m) {
                                       self.force_stream_sample,
                                       self.force_score_context_attention,
                                       self.quantization,
-                                      self.checkpoint_path);
+                                      self.checkpoint_path,
+                                      self.sid_trie_config);
             },
             [](py::tuple t) {
-                if (t.size() != 10)
+                if (t.size() != 10 && t.size() != 11)
                     throw std::runtime_error("Invalid state!");
                 SpeculativeExecutionConfig c;
                 try {
@@ -719,6 +721,8 @@ PYBIND11_MODULE(libth_transformer_config, m) {
                     c.force_score_context_attention = t[7].cast<bool>();
                     c.quantization                  = t[8].cast<std::string>();
                     c.checkpoint_path               = t[9].cast<std::string>();
+                    if (t.size() > 10)
+                        c.sid_trie_config = t[10].cast<std::string>();
                 } catch (const std::exception& e) {
                     throw std::runtime_error(std::string("SpeculativeExecutionConfig unpickle error: ") + e.what());
                 }

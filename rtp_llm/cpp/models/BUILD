@@ -52,6 +52,8 @@ cc_library(
         "logits_processor/ThinkModeLogitsProcessor.h",
         "logits_processor/TreeLogitsProcessor.h",
         "logits_processor/RecommendationLogitsProcessor.h",
+        "logits_processor/GlobalTrieCSR.h",
+        "logits_processor/TriePruningLogitsProcessor.h",
         "logits_processor/LogitsProcessorFactory.h",
     ],
     srcs = [
@@ -61,6 +63,8 @@ cc_library(
         "logits_processor/ThinkModeLogitsProcessor.cc",
         "logits_processor/TreeLogitsProcessor.cc",
         "logits_processor/RecommendationLogitsProcessor.cc",
+        "logits_processor/GlobalTrieCSR.cc",
+        "logits_processor/TriePruningLogitsProcessor.cc",
         "logits_processor/LogitsProcessorFactory.cc",
     ],
     deps = [

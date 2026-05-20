@@ -61,3 +61,19 @@ cc_test(
     },
     exec_properties = {'gpu':'H20'},
 )
+
+cc_test(
+    name = "trie_pruning_logits_processor_test",
+    srcs = [
+        "TriePruningLogitsProcessorTest.cc",
+    ],
+    data = [
+        "sid_trie_test.json",
+    ],
+    copts = test_copts,
+    deps = test_deps,
+    env = {
+        "TEST_USING_DEVICE": "CUDA",
+    },
+    exec_properties = {'gpu':'H20'},
+)

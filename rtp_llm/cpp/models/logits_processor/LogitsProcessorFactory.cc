@@ -4,11 +4,15 @@
 #include "rtp_llm/cpp/models/logits_processor/TreeLogitsProcessor.h"
 #include "rtp_llm/cpp/models/logits_processor/MultiSeqLogitsProcessor.h"
 #include "rtp_llm/cpp/models/logits_processor/RecommendationLogitsProcessor.h"
+#include "rtp_llm/cpp/models/logits_processor/TriePruningLogitsProcessor.h"
 
 namespace rtp_llm {
 
-void LogitsProcessorFactory::init(const std::string& ckpt_path, const std::string& tree_decode_config) {
+void LogitsProcessorFactory::init(const std::string& ckpt_path,
+                                  const std::string& tree_decode_config,
+                                  const std::string& sid_trie_config) {
     PrefixToCandidateTokens::instance()->reloadPrefixDictWithPrefix(ckpt_path, tree_decode_config);
+    GlobalTrieStore::instance()->init(ckpt_path, sid_trie_config);
 }
 
 std::vector<BaseLogitsProcessorPtr>
@@ -32,6 +36,12 @@ LogitsProcessorFactory::createLogitsProcessors(std::shared_ptr<GenerateInput> ge
     auto rec_processor = RecommendationLogitsProcessor::fromGenerateInput(generate_input, init_batch_size);
     if (rec_processor != nullptr) {
         result.push_back(std::static_pointer_cast<BaseLogitsProcessor>(rec_processor));
+    }
+
+    // Trie-based whitelist pruning
+    auto trie_processor = TriePruningLogitsProcessor::fromGenerateInput(generate_input, init_batch_size);
+    if (trie_processor != nullptr) {
+        result.push_back(std::static_pointer_cast<BaseLogitsProcessor>(trie_processor));
     }
 
     auto multi_seq_processor = MultiSeqLogitsProcessor::fromGenerateInput(generate_input, eos_token_id);

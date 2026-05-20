@@ -155,6 +155,6 @@ py_runtime(
 refresh_compile_commands(
     name = "refresh_compdb",
     targets = {
-        "//rtp_llm/cpp/model_rpc:model_rpc_server": "--config=cuda12_6 --config=debug --sandbox_base=/mnt/ram/",
+        "//rtp_llm:rtp_llm_package_libs": "--verbose_failures --config=cuda12_6 --config=debug --config=sm9x --test_output=errors",
     },
 )

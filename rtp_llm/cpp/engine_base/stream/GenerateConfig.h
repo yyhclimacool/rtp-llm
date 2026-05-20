@@ -89,13 +89,16 @@ public:
     std::string        trace_id;
     bool               force_batch = false;  // If true, streams with same batch_group_id must be scheduled together
     std::optional<int> batch_group_timeout;
-    std::string      unique_key;
+    std::string        unique_key;
 
     // 生成式推荐：组合 token 粒度去重与曝光过滤
     // combo_token_size 表示一个商品由多少个连续 token 组成（0 表示关闭该功能）
-    int                           combo_token_size = 0;
+    int combo_token_size = 0;
     // banned_combo_token_ids 是禁止生成的商品 token 组合列表，每项长度应等于 combo_token_size
     std::vector<std::vector<int>> banned_combo_token_ids;
+
+    // Trie-based whitelist pruning: list of ad_ids allowed for this request
+    std::vector<std::string> trie_whitelist_ad_ids;
 
     bool top1() {
         return top_k == 1;
@@ -149,9 +152,10 @@ public:
                      << ", gen_timeline: " << gen_timeline << ", profile_step: " << profile_step
                      << ", reuse_cache: " << reuse_cache << ", enable_device_cache: " << enable_device_cache
                      << ", enable_memory_cache: " << enable_memory_cache
-                     << ", enable_remote_cache: " << enable_remote_cache << ", force_batch: " << force_batch << ", unique_key: " << unique_key
-                     << ", combo_token_size: " << combo_token_size
-                     << ", banned_combo_token_ids_size: " << banned_combo_token_ids.size() << "}";
+                     << ", enable_remote_cache: " << enable_remote_cache << ", force_batch: " << force_batch
+                     << ", unique_key: " << unique_key << ", combo_token_size: " << combo_token_size
+                     << ", banned_combo_token_ids_size: " << banned_combo_token_ids.size()
+                     << ", trie_whitelist_ad_ids_size: " << trie_whitelist_ad_ids.size() << "}";
         return debug_string.str();
     }
 
@@ -237,6 +241,7 @@ public:
         JSONIZE(unique_key);
         JSONIZE(combo_token_size);
         JSONIZE(banned_combo_token_ids);
+        JSONIZE(trie_whitelist_ad_ids);
 #undef JSONIZE
 #undef JSONIZE_OPTIONAL
     }

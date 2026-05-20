@@ -209,7 +209,8 @@ MtpExecutor::MtpExecutor(const EngineInitParams&                        params,
                                                               params.sp_config,
                                                               warm_up_));
 
-    LogitsProcessorFactory::init(params.model_config_.ckpt_path, params.sp_config.tree_decode_config);
+    LogitsProcessorFactory::init(
+        params.model_config_.ckpt_path, params.sp_config.tree_decode_config, params.sp_config.sid_trie_config);
     cudaProfilerBegin();
 
     for (auto& mtp_params : *propose_params->mtp_model_params_) {
