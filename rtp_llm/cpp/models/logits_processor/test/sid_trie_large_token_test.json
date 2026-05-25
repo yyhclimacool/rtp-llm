@@ -1,0 +1,9 @@
+{
+    "start_token_id": 225,
+    "end_token_id": 2,
+    "ads": [
+        {"ad_id": "big_1", "sid_path": [150000, 200, 300]},
+        {"ad_id": "big_2", "sid_path": [150000, 201, 301]},
+        {"ad_id": "big_3", "sid_path": [5000, 200, 300]}
+    ]
+}

@@ -12,8 +12,8 @@ namespace rtp_llm {
 
 struct PerRequestTrieFilter {
     std::vector<uint32_t> sorted_leaves;
-    uint64_t              root_children_active[64] = {};
-    bool                  root_active_built        = false;
+    std::vector<uint64_t> root_children_active;
+    bool                  root_active_built = false;
 
     void build(const std::vector<std::string>& whitelist_ad_ids, const AdIdMapping& mapping, const GlobalTrieCSR& trie);
     void buildRootActive(const GlobalTrieCSR& trie);
@@ -70,7 +70,6 @@ public:
     const std::vector<StreamTriePruningInfo>& infos() const {
         return infos_;
     }
-
     void insert(std::shared_ptr<TriePruningLogitsProcessor> others) {
         if (others != nullptr) {
             infos_.insert(infos_.end(), others->infos_.begin(), others->infos_.end());

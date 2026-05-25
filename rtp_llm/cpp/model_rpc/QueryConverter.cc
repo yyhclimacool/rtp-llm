@@ -102,6 +102,11 @@ std::shared_ptr<GenerateConfig> QueryConverter::transGenerateConfig(const Genera
         generate_config->banned_combo_token_ids.push_back(std::move(combo));
     }
 
+    // Trie-based whitelist pruning
+    for (const auto& ad_id : config_proto->trie_whitelist_ad_ids()) {
+        generate_config->trie_whitelist_ad_ids.push_back(ad_id);
+    }
+
     return generate_config;
 }
 

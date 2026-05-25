@@ -51,6 +51,14 @@ def init_speculative_decoding_group_args(parser, sp_config):
         help="Tree decode的配置文件名，定义了从前缀词到候选Token的映射。",
     )
     speculative_decoding_group.add_argument(
+        "--sid_trie_config",
+        env_name="SID_TRIE_CONFIG",
+        bind_to=(sp_config, "sid_trie_config"),
+        type=str,
+        default="",
+        help="Trie白名单裁剪的配置文件名，定义了广告sid到token路径的映射。",
+    )
+    speculative_decoding_group.add_argument(
         "--sp_act_type",
         env_name="SP_ACT_TYPE",
         type=str,

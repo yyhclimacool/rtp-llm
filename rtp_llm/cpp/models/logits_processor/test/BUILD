@@ -69,6 +69,7 @@ cc_test(
     ],
     data = [
         "sid_trie_test.json",
+        "sid_trie_large_token_test.json",
     ],
     copts = test_copts,
     deps = test_deps,

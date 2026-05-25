@@ -22,9 +22,10 @@ struct GlobalTrieCSR {
     std::vector<uint32_t> node_leaf_hi;
     std::vector<uint8_t>  node_is_leaf;
 
-    uint32_t num_nodes    = 0;
-    uint32_t num_leaves   = 0;
-    int32_t  end_token_id = 0;
+    uint32_t num_nodes      = 0;
+    uint32_t num_leaves     = 0;
+    int32_t  start_token_id = 0;
+    int32_t  end_token_id   = 0;
 
     uint32_t transition(uint32_t current_node_id, int32_t token) const {
         uint32_t offset = node_children_offset[current_node_id];
@@ -58,7 +59,7 @@ struct AdIdMapping {
 
 class GlobalTrieStore {
 public:
-    static std::shared_ptr<GlobalTrieStore> instance() {
+    static std::shared_ptr<GlobalTrieStore>& instance() {
         static auto inst = std::shared_ptr<GlobalTrieStore>(new GlobalTrieStore());
         return inst;
     }

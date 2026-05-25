@@ -155,6 +155,6 @@ py_runtime(
 refresh_compile_commands(
     name = "refresh_compdb",
     targets = {
-        "//rtp_llm:rtp_llm_package_libs": "--verbose_failures --config=cuda12_6 --config=debug --config=sm9x --test_output=errors",
+        "//rtp_llm:rtp_llm_package_libs": "--verbose_failures --config=cuda12_9 --config=debug --config=sm9x --test_output=errors",
     },
 )

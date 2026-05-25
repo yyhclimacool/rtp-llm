@@ -1,4 +1,5 @@
 {
+    "start_token_id": 225,
     "end_token_id": 2,
     "ads": [
         {"ad_id": "ad_1001", "sid_path": [10, 20, 30]},

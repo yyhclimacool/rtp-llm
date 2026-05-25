@@ -75,6 +75,8 @@ class GenerateConfig(BaseModel):
     combo_token_size: int = 0
     banned_combo_token_ids: List[List[int]] = []
     auto_parse_banned_combo: bool = False
+    # Trie-based whitelist pruning: 白名单广告 ad_id 列表，用于 per-request Trie 裁剪
+    trie_whitelist_ad_ids: List[str] = []
     random_seed: Optional[Union[List[int], int]] = None
     top_p_decay: Optional[Union[List[float], float]] = None
     top_p_min: Optional[Union[List[float], float]] = None

@@ -13,13 +13,15 @@ namespace rtp_llm {
 namespace {
 
 struct TrieNode {
-    std::unordered_map<int32_t, uint32_t> children;      // token_id -> child node index
-    int64_t                               ad_id   = -1;  // only set for leaf nodes
-    bool                                  is_leaf = false;
+    std::unordered_map<int32_t, uint32_t>     children;         // token_id -> child node index (for Phase 1 insertion)
+    std::vector<std::pair<int32_t, uint32_t>> sorted_children;  // sorted by token_id (built after Phase 1)
+    std::string                               ad_id;            // only set for leaf nodes
+    bool                                      is_leaf = false;
 };
 
 struct SidTrieJsonConfig: public autil::legacy::Jsonizable {
-    int32_t end_token_id = 2;
+    int32_t start_token_id = 225;
+    int32_t end_token_id   = 2;
     // Each entry: {"ad_id": "B0L6THWCFM", "sid_path": [782, 1501, 3, 256]}
     struct AdEntry: public autil::legacy::Jsonizable {
         std::string      ad_id;
@@ -32,6 +34,7 @@ struct SidTrieJsonConfig: public autil::legacy::Jsonizable {
     std::vector<AdEntry> ads;
 
     void Jsonize(autil::legacy::Jsonizable::JsonWrapper& json) override {
+        json.Jsonize("start_token_id", start_token_id, start_token_id);
         json.Jsonize("end_token_id", end_token_id, end_token_id);
         json.Jsonize("ads", ads, ads);
     }
@@ -75,6 +78,7 @@ bool GlobalTrieStore::loadFromJson(const std::string& file_path) {
         for (int32_t token : ad.sid_path) {
             auto it = nodes[current].children.find(token);
             if (it == nodes[current].children.end()) {
+                // 将当前 child 插入新节点
                 uint32_t new_idx               = nodes.size();
                 nodes[current].children[token] = new_idx;
                 nodes.emplace_back();
@@ -83,12 +87,23 @@ bool GlobalTrieStore::loadFromJson(const std::string& file_path) {
                 current = it->second;
             }
         }
+        // path 遍历完了必然到达叶子节点
         nodes[current].is_leaf = true;
         nodes[current].ad_id   = ad.ad_id;
         ad_leaf_pairs.emplace_back(ad.ad_id, current);
     }
 
     uint32_t total_nodes = nodes.size();
+
+    // Pre-sort children for all nodes (used by both Phase 2 and Phase 3)
+    for (auto& node : nodes) {
+        node.sorted_children.reserve(node.children.size());
+        for (const auto& [token, child_idx] : node.children) {
+            node.sorted_children.emplace_back(token, child_idx);
+        }
+        std::sort(node.sorted_children.begin(), node.sorted_children.end());
+        node.children.clear();
+    }
 
     // Phase 2: DFS to assign leaf indices and compute [leaf_lo, leaf_hi) intervals
     // Children are visited in sorted token_id order to ensure DFS-order leaf contiguity
@@ -102,31 +117,22 @@ bool GlobalTrieStore::loadFromJson(const std::string& file_path) {
 
     // Iterative DFS
     struct DfsFrame {
-        uint32_t                                  node_idx;
-        std::vector<std::pair<int32_t, uint32_t>> sorted_children;
-        size_t                                    child_pos;
+        uint32_t node_idx;
+        size_t   child_pos;
     };
 
     std::vector<DfsFrame> stack;
-    {
-        DfsFrame root_frame;
-        root_frame.node_idx  = 0;
-        root_frame.child_pos = 0;
-        for (const auto& [token, child_idx] : nodes[0].children) {
-            root_frame.sorted_children.emplace_back(token, child_idx);
-        }
-        std::sort(root_frame.sorted_children.begin(), root_frame.sorted_children.end());
-        stack.push_back(std::move(root_frame));
-    }
+    stack.push_back({0, 0});
 
     // Record leaf_lo at entry
     leaf_lo[0] = leaf_counter;
 
     while (!stack.empty()) {
-        auto& frame = stack.back();
+        auto&       frame    = stack.back();
+        const auto& children = nodes[frame.node_idx].sorted_children;
 
-        if (frame.child_pos < frame.sorted_children.size()) {
-            uint32_t child_idx = frame.sorted_children[frame.child_pos].second;
+        if (frame.child_pos < children.size()) {
+            uint32_t child_idx = children[frame.child_pos].second;
             frame.child_pos++;
 
             leaf_lo[child_idx] = leaf_counter;
@@ -137,14 +143,7 @@ bool GlobalTrieStore::loadFromJson(const std::string& file_path) {
                 leaf_counter++;
                 leaf_hi[child_idx] = leaf_counter;
             } else {
-                DfsFrame child_frame;
-                child_frame.node_idx  = child_idx;
-                child_frame.child_pos = 0;
-                for (const auto& [token, grandchild_idx] : nodes[child_idx].children) {
-                    child_frame.sorted_children.emplace_back(token, grandchild_idx);
-                }
-                std::sort(child_frame.sorted_children.begin(), child_frame.sorted_children.end());
-                stack.push_back(std::move(child_frame));
+                stack.push_back({child_idx, 0});
             }
         } else {
             // All children processed, set leaf_hi
@@ -155,38 +154,31 @@ bool GlobalTrieStore::loadFromJson(const std::string& file_path) {
 
     uint32_t total_leaves = leaf_counter;
 
-    // Phase 3: Build CSR format
+    // Phase 3: Build CSR (Compressed Sparse Row) format
     // Count total children edges
     size_t total_edges = 0;
     for (const auto& node : nodes) {
-        total_edges += node.children.size();
+        total_edges += node.sorted_children.size();
     }
 
     trie_.all_children_token_ids.resize(total_edges);
     trie_.all_children_node_ids.resize(total_edges);
     trie_.node_children_offset.resize(total_nodes);
     trie_.node_children_count.resize(total_nodes);
-    trie_.node_leaf_lo = std::move(leaf_lo);
-    trie_.node_leaf_hi = std::move(leaf_hi);
-    trie_.node_is_leaf = std::move(is_leaf);
-    trie_.num_nodes    = total_nodes;
-    trie_.num_leaves   = total_leaves;
-    trie_.end_token_id = config.end_token_id;
+    trie_.node_leaf_lo   = std::move(leaf_lo);
+    trie_.node_leaf_hi   = std::move(leaf_hi);
+    trie_.node_is_leaf   = std::move(is_leaf);
+    trie_.num_nodes      = total_nodes;
+    trie_.num_leaves     = total_leaves;
+    trie_.start_token_id = config.start_token_id;
+    trie_.end_token_id   = config.end_token_id;
 
     uint32_t edge_offset = 0;
     for (uint32_t i = 0; i < total_nodes; ++i) {
         trie_.node_children_offset[i] = edge_offset;
-        trie_.node_children_count[i]  = static_cast<uint16_t>(nodes[i].children.size());
+        trie_.node_children_count[i]  = static_cast<uint16_t>(nodes[i].sorted_children.size());
 
-        // Sort children by token_id for binary search during transition
-        std::vector<std::pair<int32_t, uint32_t>> sorted_children;
-        sorted_children.reserve(nodes[i].children.size());
-        for (const auto& [token, child_idx] : nodes[i].children) {
-            sorted_children.emplace_back(token, child_idx);
-        }
-        std::sort(sorted_children.begin(), sorted_children.end());
-
-        for (const auto& [token, child_idx] : sorted_children) {
+        for (const auto& [token, child_idx] : nodes[i].sorted_children) {
             trie_.all_children_token_ids[edge_offset] = token;
             trie_.all_children_node_ids[edge_offset]  = child_idx;
             edge_offset++;

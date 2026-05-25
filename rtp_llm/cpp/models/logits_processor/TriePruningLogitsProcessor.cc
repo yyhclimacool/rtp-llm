@@ -29,7 +29,7 @@ void PerRequestTrieFilter::build(const std::vector<std::string>& whitelist_ad_id
 }
 
 void PerRequestTrieFilter::buildRootActive(const GlobalTrieCSR& trie) {
-    std::memset(root_children_active, 0, sizeof(root_children_active));
+    root_children_active.clear();
     root_active_built = false;
 
     if (trie.num_nodes == 0) {
@@ -38,6 +38,15 @@ void PerRequestTrieFilter::buildRootActive(const GlobalTrieCSR& trie) {
 
     uint32_t offset = trie.node_children_offset[0];
     uint16_t count  = trie.node_children_count[0];
+
+    if (count == 0) {
+        return;
+    }
+
+    // Determine bitmap size from max token_id among root's children
+    int32_t max_token_id = trie.all_children_token_ids[offset + count - 1];  // children are sorted
+    size_t  bitmap_size  = (static_cast<size_t>(max_token_id) >> 6) + 1;
+    root_children_active.assign(bitmap_size, 0);
 
     auto ptr = sorted_leaves.begin();
     for (uint16_t i = 0; i < count; ++i) {
@@ -121,8 +130,10 @@ void TriePruningLogitsProcessor::process(const SamplerInputs& inputs, size_t sta
 
         // Case 2: root node with precomputed L1 bitmap
         if (current_node_id == 0 && info.filter->root_active_built) {
+            const auto& bitmap = info.filter->root_children_active;
             for (size_t t = 0; t < vocab_size; ++t) {
-                if (info.filter->root_children_active[t >> 6] & (1ULL << (t & 63))) {
+                size_t slot = t >> 6;
+                if (slot < bitmap.size() && (bitmap[slot] & (1ULL << (t & 63)))) {
                     batch_candidate_token_ids[i].push_back(t);
                 }
             }

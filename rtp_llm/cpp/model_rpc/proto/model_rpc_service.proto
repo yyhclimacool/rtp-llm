@@ -102,6 +102,8 @@ message GenerateConfigPB {
     // 生成式推荐：组合 token 粒度去重与曝光过滤
     int32 combo_token_size = 58;
     IntMatrix banned_combo_token_ids = 59;
+    // Trie-based whitelist pruning: per-request 白名单广告 ad_id 列表
+    repeated string trie_whitelist_ad_ids = 60;
 }
 
 message MMPreprocessConfigPB {
