@@ -23,6 +23,7 @@ AUTIL_LOG_SETUP(rtp_llm, RtpLLMKernelMetrics);
 AUTIL_LOG_SETUP(rtp_llm, RtpLLMSpeculativeEngineMetrics);
 AUTIL_LOG_SETUP(rtp_llm, RtpLLmEplbMetrics);
 AUTIL_LOG_SETUP(rtp_llm, RtpLLMCacheStoreMetrics);
+AUTIL_LOG_SETUP(rtp_llm, RtpLLMPerfMetrics);
 AUTIL_LOG_SETUP(rtp_llm, RtpLLMKVCacheInfoMetrics);
 AUTIL_LOG_SETUP(rtp_llm, RtpLLMMemoryCacheMetrics);
 AUTIL_LOG_SETUP(rtp_llm, RtpLLMRemoteCacheMatchMetrics);
@@ -326,6 +327,19 @@ void RtpLLMTokenPSMetrics::report(const kmonitor::MetricsTags* tags, RtpLLMToken
     REPORT_MUTABLE_METRIC(context_tps_metric, collector->context_tps);
     REPORT_MUTABLE_METRIC(generate_tps_metric, collector->generate_tps);
     REPORT_MUTABLE_METRIC(total_tps_metric, collector->total_tps);
+}
+
+bool RtpLLMPerfMetrics::init(kmonitor::MetricsGroupManager* manager) {
+    REGISTER_GAUGE_MUTABLE_METRIC(num_flops_metric, "rtp_llm_estimated_flops");
+    REGISTER_GAUGE_MUTABLE_METRIC(num_read_bytes_metric, "rtp_llm_estimated_read_bytes");
+    REGISTER_GAUGE_MUTABLE_METRIC(num_write_bytes_metric, "rtp_llm_estimated_write_bytes");
+    return true;
+}
+
+void RtpLLMPerfMetrics::report(const kmonitor::MetricsTags* tags, RtpLLMPerfMetricsCollector* collector) {
+    REPORT_MUTABLE_METRIC(num_flops_metric, collector->num_flops);
+    REPORT_MUTABLE_METRIC(num_read_bytes_metric, collector->num_read_bytes);
+    REPORT_MUTABLE_METRIC(num_write_bytes_metric, collector->num_write_bytes);
 }
 
 bool RtpLLMCacheMetrics::init(kmonitor::MetricsGroupManager* manager) {

@@ -85,6 +85,8 @@ public:
     int64_t input_vocab_size           = 0;  // 0 if not set
     int64_t type_vocab_size            = 0;
     int64_t embedding_size             = 0;
+    int64_t inter_size                 = 0;  // FFN intermediate size
+    int64_t moe_inter_size             = 0;  // MoE expert FFN intermediate size
     int64_t expert_num                 = 0;
     int64_t moe_k                      = 0;
     bool    moe_normalize_expert_scale = false;

@@ -863,6 +863,36 @@ private:
     AUTIL_LOG_DECLARE();
 };
 
+class RtpLLMPerfMetricsCollector final {
+public:
+    void merge(const RtpLLMPerfMetricsCollector* collector) {
+        if (collector) {
+            num_flops += collector->num_flops;
+            num_read_bytes += collector->num_read_bytes;
+            num_write_bytes += collector->num_write_bytes;
+        }
+    }
+
+public:
+    int64_t num_flops       = 0;
+    int64_t num_read_bytes  = 0;
+    int64_t num_write_bytes = 0;
+};
+
+class RtpLLMPerfMetrics: public kmonitor::MetricsGroup {
+public:
+    bool init(kmonitor::MetricsGroupManager* manager) override;
+    void report(const kmonitor::MetricsTags* tags, RtpLLMPerfMetricsCollector* collector);
+
+public:
+    kmonitor::MutableMetric* num_flops_metric       = nullptr;
+    kmonitor::MutableMetric* num_read_bytes_metric  = nullptr;
+    kmonitor::MutableMetric* num_write_bytes_metric = nullptr;
+
+private:
+    AUTIL_LOG_DECLARE();
+};
+
 bool initKmonitorFactory();
 void stopKmonitorFactory();
 
