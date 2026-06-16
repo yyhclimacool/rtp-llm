@@ -117,6 +117,7 @@ NormalExecutor::NormalExecutor(const EngineInitParams&                params,
 }
 
 absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams) {
+    int64_t                        process_start_us = autil::TimeUtility::currentTimeInMicroSeconds();
     StreamGroups                   stream_groups(streams);
     RtpLLMExecutorMetricsCollector executor_collector;
     RtpLLMTokenPSMetricsCollector  tps_collector;
@@ -196,6 +197,27 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
             batch_stream_processor_->dispatch(stream_groups, {std::move(model_output), std::move(sampler_output)});
         executor_collector.dispatch_output_us = autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
         reportMetrics(stream_groups, executor_collector, tps_collector);
+
+        // 把本 step（整 batch）的执行阶段耗时累加进参与本 step 的每条 stream，按 prefill/decode 阶段分别累加，
+        // 供 [REQ_LIFECYCLE] 拆解。prefill/decode 划分用 step 开始时构造的 stream_groups（不受 dispatch 改状态影响）。
+        int64_t step_end_us = autil::TimeUtility::currentTimeInMicroSeconds();
+        int64_t step_us     = step_end_us - process_start_us;
+        for (const auto& stream : stream_groups.contextStreams()) {
+            stream->accumulateStepLatency(/*is_context=*/true,
+                                          step_us,
+                                          executor_collector.model_forward_us,
+                                          executor_collector.sample_input_us,
+                                          executor_collector.dispatch_output_us,
+                                          step_end_us);
+        }
+        for (const auto& stream : stream_groups.decodeStreams()) {
+            stream->accumulateStepLatency(/*is_context=*/false,
+                                          step_us,
+                                          executor_collector.model_forward_us,
+                                          executor_collector.sample_input_us,
+                                          executor_collector.dispatch_output_us,
+                                          step_end_us);
+        }
 
         model_->releaseBuffers();
 

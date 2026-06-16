@@ -510,6 +510,8 @@ void GenerateStream::reportEventWithoutLock(StreamEvents::EventType event,
 void GenerateStream::reportError(ErrorCode error_code, const std::string& error_msg) {
     std::lock_guard<std::mutex> lock(*mutex_);
     generate_status_->reportEvent(StreamEvents::Error, error_code, error_msg);
+    // 报错后 hasError() 立即为真，唤醒可能阻塞在输出队列上的消费者，使其尽快退出而非等满 1s 超时。
+    wakeupOutputQueue();
 }
 
 bool GenerateStream::hasEvent(StreamEvents::EventType event) const {
@@ -542,6 +544,8 @@ StreamState GenerateStream::moveToNext() {
     // notify one thread waiting for stream completion
     if (getStatus() == StreamState::FINISHED) {
         cv_->notify_one();
+        // 唤醒可能正阻塞在输出队列上的消费者，否则它要等满 1s 超时才发现流已结束（尾延迟）。
+        wakeupOutputQueue();
     }
     return state;
 }
@@ -951,6 +955,43 @@ void GenerateStream::reportStreamMetrics() {
             if (timeout) {
                 collector.timeout_latency_us = getTimeoutMs() * 1000;
             }
+            // total = wait + prefill + decode；ttft(first_token_latency) = wait + prefill。
+            const int64_t prefill_us = collector.first_token_latency_us - collector.wait_latency_us;
+            const int64_t decode_us  = collector.total_latency_us - collector.first_token_latency_us;
+            // last_step：最后一次参与 step 相对 begin 的时刻；idle：最后一次 step 之后到对象析构上报的空档
+            //（生成早已结束、stream 对象仍未释放，多见于取消/客户端慢读/收尾滞后）。
+            const int64_t last_step_rel_us = last_step_time_us_ > 0 ? last_step_time_us_ - begin_time_us_ : 0;
+            const int64_t idle_us          = last_step_time_us_ > 0 ? collector.total_latency_us - last_step_rel_us : 0;
+            // pf[...]/de[...] 分别为本请求 prefill / decode 阶段各 step（整 batch 维度）的阶段耗时之和。
+            RTP_LLM_LOG_INFO("[REQ_LIFECYCLE] stream=%ld total=%ldus wait=%ldus prefill=%ldus decode=%ldus ttft=%ldus "
+                             "last_step=%ldus idle=%ldus "
+                             "pf[n=%zu step=%ldus fwd=%ldus sample=%ldus dispatch=%ldus] "
+                             "de[n=%zu step=%ldus fwd=%ldus sample=%ldus dispatch=%ldus] "
+                             "iter=%ld in=%ld out=%ld batch=%ld cancelled=%d timeout=%d",
+                             streamId(),
+                             collector.total_latency_us,
+                             collector.wait_latency_us,
+                             prefill_us,
+                             decode_us,
+                             collector.first_token_latency_us,
+                             last_step_rel_us,
+                             idle_us,
+                             acc_prefill_step_count_,
+                             acc_prefill_step_us_,
+                             acc_prefill_fwd_us_,
+                             acc_prefill_sample_us_,
+                             acc_prefill_dispatch_us_,
+                             acc_decode_step_count_,
+                             acc_decode_step_us_,
+                             acc_decode_fwd_us_,
+                             acc_decode_sample_us_,
+                             acc_decode_dispatch_us_,
+                             collector.iterate_count,
+                             collector.input_token_length,
+                             collector.output_token_length,
+                             collector.query_batch_size,
+                             (int)cancelled,
+                             (int)timeout);
         }
         // pass tag will cause default tags deep copy
         static kmonitor::MetricsTags timeout_tag("timeout", "true");

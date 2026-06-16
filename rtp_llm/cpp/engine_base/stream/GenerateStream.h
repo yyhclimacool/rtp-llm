@@ -122,6 +122,10 @@ public:
         return false;
     }
 
+    // 唤醒阻塞在输出队列上的消费者（nextOutput 的 waitNotEmpty）。在流转为 FINISHED 或报错时调用，
+    // 避免消费线程白等 SynchronizedQueue 的 1s 超时才发现流已结束。子类持有输出队列者覆写。
+    virtual void wakeupOutputQueue() {}
+
     virtual void updateOutput(const StreamUpdateInfo& update_info) = 0;
     void         update(const StreamUpdateInfo& update_info);
     void         specUpdate(const StreamSpecUpdateInfo& update_info);
@@ -276,6 +280,31 @@ public:
     void        setMetricsReporter(kmonitor::MetricsReporterPtr metrics_reporter);
     void        reportMetric();
     std::string debugString() const;
+
+    // 由执行器在每个 step 的 dispatch 后调用：把该 step（整 batch）的执行阶段耗时累加进本 stream，
+    // 按本 stream 在该 step 处于 prefill(is_context=true) 还是 decode 阶段分别累加，
+    // 累加值为该请求各阶段所有 step 之和，用于 [REQ_LIFECYCLE] 打出 prefill/decode 各自的拆解。
+    void accumulateStepLatency(bool    is_context,
+                               int64_t step_us,
+                               int64_t model_forward_us,
+                               int64_t sample_us,
+                               int64_t dispatch_us,
+                               int64_t step_end_us) {
+        last_step_time_us_ = step_end_us;
+        if (is_context) {
+            acc_prefill_step_us_ += step_us;
+            acc_prefill_fwd_us_ += model_forward_us;
+            acc_prefill_sample_us_ += sample_us;
+            acc_prefill_dispatch_us_ += dispatch_us;
+            ++acc_prefill_step_count_;
+        } else {
+            acc_decode_step_us_ += step_us;
+            acc_decode_fwd_us_ += model_forward_us;
+            acc_decode_sample_us_ += sample_us;
+            acc_decode_dispatch_us_ += dispatch_us;
+            ++acc_decode_step_count_;
+        }
+    }
 
     void    resetBeginTime(int64_t begin_time_us);
     int64_t beginTimeUs() const {
@@ -552,16 +581,29 @@ protected:
     std::shared_ptr<CompleteTokenIds>     complete_token_ids_;
     int64_t                               begin_time_us_;
     int64_t                               wait_time_us_ = 0;
-    std::shared_ptr<StreamCacheResource>  stream_cache_resource_;
-    std::shared_ptr<bool>                 is_context_stream_;
-    size_t                                iter_count_           = 0;
-    size_t                                sp_iter_count_        = 0;
-    size_t                                last_output_pos_      = 0;
-    int                                   initial_reuse_length_ = 0;
-    int                                   reuse_length_         = 0;
-    int                                   local_reuse_length_   = 0;
-    int                                   remote_reuse_length_  = 0;
-    int                                   memory_reuse_length_  = 0;
+    // 跨 step 按阶段累加的执行耗时（us），由 accumulateStepLatency() 填充，仅引擎线程读写。
+    int64_t                              acc_prefill_step_us_     = 0;
+    int64_t                              acc_prefill_fwd_us_      = 0;
+    int64_t                              acc_prefill_sample_us_   = 0;
+    int64_t                              acc_prefill_dispatch_us_ = 0;
+    size_t                               acc_prefill_step_count_  = 0;
+    int64_t                              acc_decode_step_us_      = 0;
+    int64_t                              acc_decode_fwd_us_       = 0;
+    int64_t                              acc_decode_sample_us_    = 0;
+    int64_t                              acc_decode_dispatch_us_  = 0;
+    size_t                               acc_decode_step_count_   = 0;
+    // 该 stream 最后一次参与 step（dispatch 结束）的绝对时刻（us），用于区分生成中途等待 vs 析构滞后。
+    int64_t                              last_step_time_us_       = 0;
+    std::shared_ptr<StreamCacheResource> stream_cache_resource_;
+    std::shared_ptr<bool>                is_context_stream_;
+    size_t                               iter_count_           = 0;
+    size_t                               sp_iter_count_        = 0;
+    size_t                               last_output_pos_      = 0;
+    int                                  initial_reuse_length_ = 0;
+    int                                  reuse_length_         = 0;
+    int                                  local_reuse_length_   = 0;
+    int                                  remote_reuse_length_  = 0;
+    int                                  memory_reuse_length_  = 0;
     // prefill reuse info (PD-sep); read/write only under output_mutex_
     int64_t prefill_total_reuse_len_  = 0;
     int64_t prefill_local_reuse_len_  = 0;
