@@ -117,9 +117,7 @@ private:
     void processLogits(const GreedyParams& params, const BufferPtr& device_tokens, const BufferPtr& transposed_tokens);
 
 public:
-    void setStream(cudaStream_t stream) {
-        stream_ = stream;
-    }
+    void         setStream(cudaStream_t stream);
     cudaStream_t getStream() {
         return stream_;
     }
@@ -133,6 +131,13 @@ public:
     }
     void profileStart() override;
     void profileStop() override;
+
+    std::shared_ptr<NativeGraphRunner> getNativeGraphRunner() override;
+    void                               registerARGraphBuffers() {
+        if (custom_allreduce_comm_) {
+            custom_allreduce_comm_->registerGraphBuffers();
+        }
+    }
 
 public:
     // TODO(zhangjianning.zjn): unify batchCopy and multiCopy

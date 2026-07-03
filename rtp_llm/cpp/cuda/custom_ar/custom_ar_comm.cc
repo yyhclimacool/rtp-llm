@@ -98,6 +98,11 @@ void CustomAllReduceComm::allReduce(
     DISPATCH_CUDA_FUNCTION_DATA_TYPE(data_type, invokeCustomAllReduceDispatch, &param_, param_.barrier_flag, stream);
 }
 
+void CustomAllReduceComm::registerGraphBuffers() {
+    // No-op on CUDA: peer_comm_buffer_ptrs are fixed cudaMalloc allocations shared via cudaIpc,
+    // so pointers captured in the graph remain valid across replays. See header for details.
+}
+
 void CustomAllReduceComm::init(const NcclParam& nccl_para, cudaStream_t stream) {
     // enable P2P access
     for (size_t i = 0; i < world_size_; i++) {

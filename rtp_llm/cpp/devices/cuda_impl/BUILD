@@ -56,6 +56,7 @@ cc_library(
         "CudaFlashInfer.h",
         "CudaGraphUtils.h",
         "CudaGraphRunner.h",
+        "NativeCudaGraphRunner.h",
     ] + select({
         "@//:using_cuda12": [
             "CudaXqa.h"
@@ -80,6 +81,7 @@ cc_library(
         "CudaGraphRunner.cc",
         "CudaGraphPrefill.cc",
         "CudaGraphDecode.cc",
+        "NativeCudaGraphRunner.cc",
     ] + select({
         "@//:using_cuda12": [
             "CudaXqa.cc"

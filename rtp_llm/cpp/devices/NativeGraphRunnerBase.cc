@@ -49,6 +49,15 @@ GptModelInputs NativeGraphRunnerBase<GptModelInputs, GptModelOutputs>::prepareIn
     RTP_LLM_CHECK_WITH_INFO(old.input_embeddings == std::nullopt && old.input_embeddings_locs == nullptr,
                             "Native graph with input_embeddings not supported");
 
+    const auto maxBlockCount = [this](size_t tokens_per_block, size_t current_block_count) {
+        RTP_LLM_CHECK_WITH_INFO(tokens_per_block > 0, "tokens_per_block must be positive for native graph");
+        const auto max_seq_len = static_cast<size_t>(device_->initParams().max_seq_len);
+        return std::max(current_block_count, (max_seq_len + tokens_per_block - 1) / tokens_per_block);
+    };
+    const auto kernel_tokens_per_block = device_->initParams().kernel_tokens_per_block ?
+                                             device_->initParams().kernel_tokens_per_block :
+                                             device_->initParams().tokens_per_block;
+
     auto input             = old;
     input.combo_tokens     = device_->allocateBufferLike(*old.combo_tokens, AllocationType::HOST);
     input.input_lengths    = device_->allocateBufferLike(*old.input_lengths, AllocationType::HOST);
@@ -74,28 +83,33 @@ GptModelInputs NativeGraphRunnerBase<GptModelInputs, GptModelOutputs>::prepareIn
     input.kv_cache_kernel_block_id =
         old.kv_cache_kernel_block_id ?
             (old.kv_cache_kernel_block_id->shape().size() == 3 ?
-                 device_->allocateBuffer({DataType::TYPE_INT32,
-                                          {old.kv_cache_kernel_block_id->shape()[0],
-                                           old.kv_cache_kernel_block_id->shape()[1],
-                                           static_cast<size_t>(device_->initParams().max_seq_len)},
-                                          AllocationType::HOST}) :
-                 device_->allocateBuffer({DataType::TYPE_INT32,
-                                          {old.kv_cache_kernel_block_id->shape()[0],
-                                           static_cast<size_t>(device_->initParams().max_seq_len)},
-                                          AllocationType::HOST})) :
+                 device_->allocateBuffer(
+                     {DataType::TYPE_INT32,
+                      {old.kv_cache_kernel_block_id->shape()[0],
+                       old.kv_cache_kernel_block_id->shape()[1],
+                       maxBlockCount(kernel_tokens_per_block, old.kv_cache_kernel_block_id->shape()[2])},
+                      AllocationType::HOST}) :
+                 device_->allocateBuffer(
+                     {DataType::TYPE_INT32,
+                      {old.kv_cache_kernel_block_id->shape()[0],
+                       maxBlockCount(kernel_tokens_per_block, old.kv_cache_kernel_block_id->shape()[1])},
+                      AllocationType::HOST})) :
             nullptr;
     input.kv_cache_block_id =
-        old.kv_cache_block_id ? (old.kv_cache_block_id->shape().size() == 3 ?
-                                     device_->allocateBuffer({DataType::TYPE_INT32,
-                                                              {old.kv_cache_block_id->shape()[0],
-                                                               old.kv_cache_block_id->shape()[1],
-                                                               static_cast<size_t>(device_->initParams().max_seq_len)},
-                                                              AllocationType::HOST}) :
-                                     device_->allocateBuffer({DataType::TYPE_INT32,
-                                                              {old.kv_cache_block_id->shape()[0],
-                                                               static_cast<size_t>(device_->initParams().max_seq_len)},
-                                                              AllocationType::HOST})) :
-                                nullptr;
+        old.kv_cache_block_id ?
+            (old.kv_cache_block_id->shape().size() == 3 ?
+                 device_->allocateBuffer(
+                     {DataType::TYPE_INT32,
+                      {old.kv_cache_block_id->shape()[0],
+                       old.kv_cache_block_id->shape()[1],
+                       maxBlockCount(device_->initParams().tokens_per_block, old.kv_cache_block_id->shape()[2])},
+                      AllocationType::HOST}) :
+                 device_->allocateBuffer(
+                     {DataType::TYPE_INT32,
+                      {old.kv_cache_block_id->shape()[0],
+                       maxBlockCount(device_->initParams().tokens_per_block, old.kv_cache_block_id->shape()[1])},
+                      AllocationType::HOST})) :
+            nullptr;
     input.kv_cache_layer_to_group =
         old.kv_cache_layer_to_group ? device_->allocateBufferLike(*old.kv_cache_layer_to_group, AllocationType::HOST) :
                                       nullptr;
@@ -154,10 +168,15 @@ void NativeGraphRunnerBase<GptModelInputs, GptModelOutputs>::copy(GptModelInputs
         } else if (shape.size() == 3) {
             // Hybrid layout: [group, batch, max_blocks]
             const int group = static_cast<int>(shape[0]);
+            const int bs    = static_cast<int>(shape[1]);
             for (int g = 0; g < group; ++g) {
-                std::memcpy(dst->kv_cache_kernel_block_id->index(g)->data(),
-                            src.kv_cache_kernel_block_id->index(g)->data(),
-                            src.kv_cache_kernel_block_id->index(g)->sizeBytes());
+                auto dst_group = dst->kv_cache_kernel_block_id->index(g);
+                auto src_group = src.kv_cache_kernel_block_id->index(g);
+                for (int b = 0; b < bs; ++b) {
+                    auto dst_row = dst_group->index(b);
+                    auto src_row = src_group->index(b);
+                    std::memcpy(dst_row->data(), src_row->data(), src_row->sizeBytes());
+                }
             }
         }
     }
@@ -172,10 +191,15 @@ void NativeGraphRunnerBase<GptModelInputs, GptModelOutputs>::copy(GptModelInputs
             }
         } else if (shape.size() == 3) {
             const int group = static_cast<int>(shape[0]);
+            const int bs    = static_cast<int>(shape[1]);
             for (int g = 0; g < group; ++g) {
-                std::memcpy(dst->kv_cache_block_id->index(g)->data(),
-                            src.kv_cache_block_id->index(g)->data(),
-                            src.kv_cache_block_id->index(g)->sizeBytes());
+                auto dst_group = dst->kv_cache_block_id->index(g);
+                auto src_group = src.kv_cache_block_id->index(g);
+                for (int b = 0; b < bs; ++b) {
+                    auto dst_row = dst_group->index(b);
+                    auto src_row = src_group->index(b);
+                    std::memcpy(dst_row->data(), src_row->data(), src_row->sizeBytes());
+                }
             }
         }
     }

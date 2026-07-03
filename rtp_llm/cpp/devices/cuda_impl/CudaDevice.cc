@@ -222,6 +222,14 @@ CudaDevice::~CudaDevice() {
     cache_store_.reset();
 }
 
+void CudaDevice::setStream(cudaStream_t stream) {
+    stream_ = stream;
+    check_cuda_value(cublasSetStream(cublas_handle_, stream_));
+    if (cublas_mm_wrapper_) {
+        cublas_mm_wrapper_->setStream(stream_);
+    }
+}
+
 void CudaDevice::preRun() {
     check_cuda_value(cudaSetDevice(device_id_));
     at::cuda::setCurrentCUDAStream(*torch_default_stream_);
