@@ -9,6 +9,7 @@
 #include "rtp_llm/cpp/devices/utils/DebugUtils.h"
 #include "rtp_llm/cpp/core/Dispatch.h"
 #include "rtp_llm/cpp/kernels/kv_cache/kv_cache_utils.h"
+#include "rtp_llm/cpp/kernels/kv_cache_kernels.h"
 #include "rtp_llm/cpp/core/torch_utils/BufferTorchUtils.h"
 #include "3rdparty/flashinfer/flashinfer.h"
 #include "flashmla/flashmla.h"
@@ -36,10 +37,10 @@ bool FlashInferAttnParams::isDecode(int input_token_num) {
 
 void FlashInferAttnParams::recycle(void* p) {
     auto flashinfer = (FlashInferAttnParams*)p;
-    if (isDecode(flashinfer->input_token_num)) {
-        ParamsCache::DECODE_PARAMS_CACHE.push_back(flashinfer);
-    } else {
+    if (flashinfer->is_prefill) {
         ParamsCache::PREFILL_PARAMS_CACHE.push_back(flashinfer);
+    } else {
+        ParamsCache::DECODE_PARAMS_CACHE.push_back(flashinfer);
     }
 }
 
@@ -47,8 +48,8 @@ bool FlashInferAttnParams::check_recycle() {
     return true;
 }
 
-FlashInferAttnParams* FlashInferAttnParams::get(int batch_size, int input_token_num) {
-    auto cache = isDecode(input_token_num) ? &ParamsCache::DECODE_PARAMS_CACHE : &ParamsCache::PREFILL_PARAMS_CACHE;
+FlashInferAttnParams* FlashInferAttnParams::get(int batch_size, int input_token_num, bool is_prefill) {
+    auto cache = is_prefill ? &ParamsCache::PREFILL_PARAMS_CACHE : &ParamsCache::DECODE_PARAMS_CACHE;
     if (!cache->empty()) {
         auto params = cache->back();
         cache->pop_back();
@@ -87,8 +88,8 @@ tuple<BufferPtr, vector<torch::Tensor>> FlashInferAttnParams::allocateManyBuffer
 }
 
 FlashInferAttnParams*
-FlashInferAttnParams::create(CudaDevice* device, int batch_size, int input_token_num, int page_num) {
-    if (auto params = get(batch_size, input_token_num)) {
+FlashInferAttnParams::create(CudaDevice* device, int batch_size, int input_token_num, int page_num, bool is_prefill) {
+    if (auto params = get(batch_size, input_token_num, is_prefill)) {
         return params;
     }
     RTP_LLM_LOG_DEBUG("new FlashInferAttnParams batch_size(%d) input_token_num(%d)", batch_size, input_token_num);
@@ -256,6 +257,44 @@ void FlashInferAttnParams::refreshFlashInferBuf(CudaDevice* device, int batch_si
     shape[0] = batch_size;
     REFRESH_SHAPE(kvlen);
     REFRESH_SHAPE(paged_kv_last_page_len);
+}
+
+void FlashInferAttnParams::prepareDecodeForNativeGraph(CudaDevice*      device,
+                                                       const BufferPtr& sequence_lengths_host,
+                                                       const BufferPtr& kv_cache_block_id_device,
+                                                       int              batch_size,
+                                                       int              tokens_per_block) {
+    RTP_LLM_CHECK_WITH_INFO(sequence_lengths_host != nullptr, "sequence_lengths is required for FlashInfer decode");
+    RTP_LLM_CHECK_WITH_INFO(kv_cache_block_id_device != nullptr,
+                            "device kv block table is required for FlashInfer decode");
+    RTP_LLM_CHECK_WITH_INFO(kv_cache_block_id_device->dim() == 2,
+                            "FlashInfer decode kv block table must be 2D, got %s",
+                            kv_cache_block_id_device->debugString().c_str());
+
+    sequence_lengths_d_buffer      = device->clone({*sequence_lengths_host, AllocationType::DEVICE});
+    const int max_blocks_per_batch = static_cast<int>(kv_cache_block_id_device->shape()[1]);
+    invokePrepareFlashInferDecodeMetadata(page_indptr_d.data_ptr<int>(),
+                                          qo_indptr_d.data_ptr<int>(),
+                                          batch_indice_d.data_ptr<int>(),
+                                          positions_d.data_ptr<int>(),
+                                          kvlen_d.data_ptr<int>(),
+                                          paged_kv_last_page_len_d.data_ptr<int>(),
+                                          page_indice_d.data_ptr<int>(),
+                                          sequence_lengths_d_buffer->data<int>(),
+                                          kv_cache_block_id_device->data<int>(),
+                                          batch_size,
+                                          max_blocks_per_batch,
+                                          tokens_per_block,
+                                          device->getStream());
+
+    const std::vector<int64_t> batch_plus_one_shape = {batch_size + 1};
+    page_indptr_d.unsafeGetTensorImpl()->set_sizes_contiguous(batch_plus_one_shape);
+    qo_indptr_d.unsafeGetTensorImpl()->set_sizes_contiguous(batch_plus_one_shape);
+    const std::vector<int64_t> batch_shape = {batch_size};
+    batch_indice_d.unsafeGetTensorImpl()->set_sizes_contiguous(batch_shape);
+    positions_d.unsafeGetTensorImpl()->set_sizes_contiguous(batch_shape);
+    kvlen_d.unsafeGetTensorImpl()->set_sizes_contiguous(batch_shape);
+    paged_kv_last_page_len_d.unsafeGetTensorImpl()->set_sizes_contiguous(batch_shape);
 }
 
 bool FlashInferAttnParams::sameQLength(const BufferPtr& input_lengths_host, int batch_size, int& q_length) {
@@ -486,7 +525,8 @@ ParamsPtr FlashInferAttnParams::prepare(rtp_llm::DeviceBase*             device,
     auto params          = FlashInferAttnParams::create(cuda_device,
                                                max(MIN_CACHE_BATCH_SIZE, batch_size),
                                                max(MIN_CACHE_INPUT_TOKEN_NUM, input_token_num),
-                                               MIN_CACHE_PAGE_NUM);
+                                               MIN_CACHE_PAGE_NUM,
+                                               is_prefill);
     params->attn_configs = attn_configs;
     params->is_prefill   = is_prefill;
 
@@ -495,17 +535,24 @@ ParamsPtr FlashInferAttnParams::prepare(rtp_llm::DeviceBase*             device,
     if (kv_cache_block_id_device) {
         params->kv_cache_block_id_d = Buffer2torchTensor(kv_cache_block_id_device, false);
     }
-    params->mla_ops_type = mla_ops_type;
-    params->dtype        = dtype;
-    params->fillFlashInfer(prefix_lengths_host,
-                           sequence_lengths_host,
-                           input_lengths_host,
-                           kv_cache_block_id_host,
-                           batch_size,
-                           tokens_per_block);
-    params->refreshFlashInferBuf(cuda_device, batch_size, input_token_num);
+    params->mla_ops_type            = mla_ops_type;
+    params->dtype                   = dtype;
+    const bool native_graph_capture = device->nativeGraphCapturing() && !is_prefill;
+    if (native_graph_capture) {
+        params->prepareDecodeForNativeGraph(
+            cuda_device, sequence_lengths_host, kv_cache_block_id_device, batch_size, tokens_per_block);
+    } else {
+        params->fillFlashInfer(prefix_lengths_host,
+                               sequence_lengths_host,
+                               input_lengths_host,
+                               kv_cache_block_id_host,
+                               batch_size,
+                               tokens_per_block);
+        params->refreshFlashInferBuf(cuda_device, batch_size, input_token_num);
+    }
 
-    if (is_prefill || (group_size > 2 && skip_no_prefix)) {
+    const bool native_graph_enabled = device->initParams().hw_kernel_config.enable_native_cuda_graph;
+    if (is_prefill || (!native_graph_enabled && group_size > 2 && skip_no_prefix)) {
         params->decode_plan = false;
     } else {
         params->decode_plan = true;
@@ -513,18 +560,29 @@ ParamsPtr FlashInferAttnParams::prepare(rtp_llm::DeviceBase*             device,
 
     // Todo(tuowu): flashinfer: do not use partition-kv kernel for short sequence, when not using CUDAGraph .
     // check how short as `short sequence`.
-    bool enable_cuda_graph    = device->initParams().hw_kernel_config.enable_cuda_graph;
-    params->enable_cuda_graph = enable_cuda_graph;
-    params->genPlan(batch_size,
-                    q_length,
-                    local_head_num,
-                    local_head_num_kv,
-                    size_per_head,
-                    tokens_per_block,
-                    attn_configs.kv_lora_rank,
-                    attn_configs.use_mla,
-                    reinterpret_cast<int64_t>(cuda_device->getStream()),
-                    (!is_prefill && enable_cuda_graph));  // cuda_stream
+    const bool enable_cuda_graph = device->initParams().hw_kernel_config.enable_cuda_graph || native_graph_enabled;
+    params->enable_cuda_graph    = enable_cuda_graph;
+    if (!native_graph_capture) {
+        params->genPlan(batch_size,
+                        q_length,
+                        local_head_num,
+                        local_head_num_kv,
+                        size_per_head,
+                        tokens_per_block,
+                        attn_configs.kv_lora_rank,
+                        attn_configs.use_mla,
+                        reinterpret_cast<int64_t>(cuda_device->getStream()),
+                        (!is_prefill && enable_cuda_graph));  // cuda_stream
+        if (native_graph_enabled && !is_prefill && !attn_configs.use_mla) {
+            ParamsCache::NATIVE_DECODE_PLANS.push_back(params->plan);
+        }
+    } else {
+        RTP_LLM_CHECK_WITH_INFO(!ParamsCache::NATIVE_DECODE_PLANS.empty(),
+                                "FlashInfer decode plan must be initialized before native graph capture");
+        params->plan = ParamsCache::NATIVE_DECODE_PLANS.back();
+        RTP_LLM_CHECK_WITH_INFO(params->plan.defined() && params->plan.numel() > 0,
+                                "FlashInfer decode plan must be initialized before native graph capture");
+    }
 
     return ret;
 }

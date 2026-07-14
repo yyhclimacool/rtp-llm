@@ -245,9 +245,7 @@ Output NativeGraphRunnerBase<Input, Output>::run(size_t                       pr
     if (hasCudaGraph) {
         auto [_, cudagraph, input_buffer, output_buffer] = *map_->get(state);
         copy(&input_buffer, input);
-        device_->syncAndCheck();
         cudagraph->replay();
-        device_->syncAndCheck();
         CUDAGRAPH_LOG("cudagraph launch done");
         return output_buffer;
     }

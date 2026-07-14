@@ -11,19 +11,19 @@ class CudaDevice;
 
 class CudaGraphExecutor: public ExecutorBase {
 public:
-    CudaGraphExecutor(CudaDevice* device, std::shared_ptr<at::cuda::CUDAStream> stream):
-        ExecutorBase(), device_(device), graph_(std::make_shared<at::cuda::CUDAGraph>()), capture_stream_(stream) {}
-    void replay() override {
-        graph_->replay();
-    }
+    CudaGraphExecutor(CudaDevice* device, std::shared_ptr<at::cuda::CUDAStream> stream);
+    ~CudaGraphExecutor() override;
+    void replay() override;
     void captureBegin() override;
     void captureEnd() override;
 
 private:
-    CudaDevice*                           device_         = nullptr;
-    std::shared_ptr<at::cuda::CUDAGraph>  graph_          = nullptr;
-    std::shared_ptr<at::cuda::CUDAStream> capture_stream_ = nullptr;
-    std::shared_ptr<at::cuda::CUDAStream> origin_stream_  = nullptr;
+    CudaDevice*                           device_             = nullptr;
+    std::shared_ptr<at::cuda::CUDAGraph>  graph_              = nullptr;
+    std::shared_ptr<at::cuda::CUDAStream> capture_stream_     = nullptr;
+    std::shared_ptr<at::cuda::CUDAStream> origin_stream_      = nullptr;
+    cudaEvent_t                           input_ready_event_  = nullptr;
+    cudaEvent_t                           output_ready_event_ = nullptr;
 };
 
 template<typename Input, typename Output>

@@ -79,6 +79,88 @@ void invokeConvertOffsetToBlockArrayData(int32_t*     offset_addr,  // [b, 2, m]
 #endif
 }
 
+__global__ void PrepareFlashInferDecodeMetadata(int32_t*       page_indptr,
+                                                int32_t*       qo_indptr,
+                                                int32_t*       batch_indices,
+                                                int32_t*       positions,
+                                                int32_t*       kv_lens,
+                                                int32_t*       paged_kv_last_page_len,
+                                                const int32_t* sequence_lengths,
+                                                int            batch_size,
+                                                int            tokens_per_block) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) {
+        return;
+    }
+
+    int page_offset = 0;
+    page_indptr[0]  = 0;
+    qo_indptr[0]    = 0;
+    for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
+        const int position = sequence_lengths[batch_idx];
+        const int kv_len   = position + 1;
+        const int page_num = (kv_len + tokens_per_block - 1) / tokens_per_block;
+
+        batch_indices[batch_idx]          = batch_idx;
+        positions[batch_idx]              = position;
+        kv_lens[batch_idx]                = kv_len;
+        paged_kv_last_page_len[batch_idx] = (kv_len - 1) % tokens_per_block + 1;
+        page_offset += page_num;
+        page_indptr[batch_idx + 1] = page_offset;
+        qo_indptr[batch_idx + 1]   = batch_idx + 1;
+    }
+}
+
+__global__ void CompactFlashInferPageIndices(int32_t*       page_indices,
+                                             const int32_t* page_indptr,
+                                             const int32_t* kv_cache_block_ids,
+                                             int            batch_size,
+                                             int            max_blocks_per_batch) {
+    for (int index = blockIdx.x * blockDim.x + threadIdx.x; index < batch_size * max_blocks_per_batch;
+         index += blockDim.x * gridDim.x) {
+        const int batch_idx = index / max_blocks_per_batch;
+        const int block_idx = index % max_blocks_per_batch;
+        const int page_num  = page_indptr[batch_idx + 1] - page_indptr[batch_idx];
+        if (block_idx < page_num) {
+            page_indices[page_indptr[batch_idx] + block_idx] = kv_cache_block_ids[index];
+        }
+    }
+}
+
+void invokePrepareFlashInferDecodeMetadata(int32_t*       page_indptr,
+                                           int32_t*       qo_indptr,
+                                           int32_t*       batch_indices,
+                                           int32_t*       positions,
+                                           int32_t*       kv_lens,
+                                           int32_t*       paged_kv_last_page_len,
+                                           int32_t*       page_indices,
+                                           const int32_t* sequence_lengths,
+                                           const int32_t* kv_cache_block_ids,
+                                           int            batch_size,
+                                           int            max_blocks_per_batch,
+                                           int            tokens_per_block,
+                                           cudaStream_t   stream) {
+    PrepareFlashInferDecodeMetadata<<<1, 1, 0, stream>>>(page_indptr,
+                                                         qo_indptr,
+                                                         batch_indices,
+                                                         positions,
+                                                         kv_lens,
+                                                         paged_kv_last_page_len,
+                                                         sequence_lengths,
+                                                         batch_size,
+                                                         tokens_per_block);
+    const int count = batch_size * max_blocks_per_batch;
+    if (count > 0) {
+        const int threads = 256;
+        const int blocks  = min((count + threads - 1) / threads, 65536);
+        CompactFlashInferPageIndices<<<blocks, threads, 0, stream>>>(
+            page_indices, page_indptr, kv_cache_block_ids, batch_size, max_blocks_per_batch);
+    }
+#if USING_CUDA
+    check_cuda_value(cudaPeekAtLastError());
+    check_cuda_error();
+#endif
+}
+
 template<typename T>
 __global__ void ReuseKVCacheIndexedBatchedKernel(T*             final_compressed_kv,
                                                  T*             final_k_pe,

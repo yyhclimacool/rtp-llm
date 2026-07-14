@@ -84,11 +84,6 @@ CudaDevice::prepareTrtAttn(const AttentionConfigs& configs, const BufferPtr& kv_
                                         batch_size,
                                         max_blocks_per_batch,
                                         run_stream);
-    if (is_sm90() && fmha_type_ == FMHAType::PAGED_TRT_V2) {
-        trt_attn->kv_cache_offset_h                        = trt_attn->kv_cache_offset.to(torch::kCPU);
-        trt_attn->kv_block_array.pagedKVBlockOffsetsOnHost = trt_attn->kv_cache_offset_h.data_ptr();
-    }
-
     check_cuda_error();
     return trt_attn;
 }

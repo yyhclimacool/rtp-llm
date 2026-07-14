@@ -44,6 +44,18 @@ cc_test(
 )
 
 cc_test(
+    name = "cuda_flashinfer_metadata_test",
+    srcs = [
+        "CudaFlashInferMetadataTest.cc",
+    ],
+    data = [],
+    env = test_envs,
+    copts = copts(),
+    deps = test_deps,
+    exec_properties = {'gpu':'H20'},
+)
+
+cc_test(
     name = "cuda_sampler_test",
     srcs = [
         "CudaSamplerTest.cc",

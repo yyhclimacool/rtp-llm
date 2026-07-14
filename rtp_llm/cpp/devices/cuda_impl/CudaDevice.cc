@@ -517,6 +517,11 @@ DevicePrepOutput CudaDevice::prepareModelRun(const DevicePrepParams& params) {
         }
         output.need_mask = (fmha_type_ == FMHAType::NONE);
     }
+    if (is_sm90() && fmha_type_ == FMHAType::PAGED_TRT_V2 && output.prefill_trt_attn) {
+        auto* prefill_trt_attn              = static_cast<TRTAttn*>(output.prefill_trt_attn.get());
+        prefill_trt_attn->kv_cache_offset_h = prefill_trt_attn->kv_cache_offset.to(torch::kCPU);
+        prefill_trt_attn->kv_block_array.pagedKVBlockOffsetsOnHost = prefill_trt_attn->kv_cache_offset_h.data_ptr();
+    }
     static bool logged_fmha_type = false;
     if (!logged_fmha_type) {
         static const char* fmha_names[] = {"FLASH_INFER",
