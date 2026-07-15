@@ -169,10 +169,19 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
     }
     {
         RTP_LLM_PROFILE_SCOPE("executor.sampler_forward");
-        int64_t start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
-        CHECK_AND_RETURN_REF(sampler_input,
-                             batch_stream_processor_->gatherSamplerInput(stream_groups, model_input, model_output));
-        sampler_output = std::move(sampler_->forward(sampler_input));
+        int64_t start_time_us        = autil::TimeUtility::currentTimeInMicroSeconds();
+        auto    sampler_input_status = [&]() {
+            RTP_LLM_PROFILE_SCOPE_DYNAMIC("executor.sampler_gather_input(batch_in=%zu,batch_out=%zu)",
+                                          stream_groups.totalSamplerBatchSizeIn(),
+                                          stream_groups.totalSamplerBatchSizeOut());
+            return batch_stream_processor_->gatherSamplerInput(stream_groups, model_input, model_output);
+        }();
+        RETURN_IF_STATUS_OR_ERROR(sampler_input_status);
+        auto& sampler_input = sampler_input_status.value();
+        {
+            RTP_LLM_PROFILE_SCOPE("executor.sampler_run");
+            sampler_output = std::move(sampler_->forward(sampler_input));
+        }
         RTP_LLM_LOG_DEBUG("sampler forward done");
         executor_collector.sample_input_us = autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
     }

@@ -3,6 +3,7 @@
 #include "rtp_llm/cpp/devices/utils/DebugUtils.h"
 #include "rtp_llm/cpp/models/logits_processor/BaseLogitsProcessor.h"
 #include "rtp_llm/cpp/models/logits_processor/LogitsProcessorStates.h"
+#include "rtp_llm/cpp/utils/ProfilingScope.h"
 #include <unordered_set>
 
 using namespace std;
@@ -13,6 +14,11 @@ Sampler::Sampler(const SamplerInitParams& params): device_(params.device) {}
 
 SamplerOutput Sampler::forward(const SamplerInputs& inputs) {
     RTP_LLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    RTP_LLM_PROFILE_SCOPE_DYNAMIC("sampler.forward(batch_in=%zu,batch_out=%zu,vocab=%zu,step=%zu)",
+                                  inputs.batch_size,
+                                  inputs.batch_size_out,
+                                  inputs.logits->shape()[1],
+                                  inputs.step);
 
 #define MAY_GET_BUFFER_VIEW(buffer_ptr, offset, size)                                                                  \
     (buffer_ptr.get() ? buffer_ptr->view((offset), (size)) : Buffer::emptyBuffer())
@@ -22,7 +28,10 @@ SamplerOutput Sampler::forward(const SamplerInputs& inputs) {
     autil::ScopeGuard guard_##buffer([&]() { buffer.updateShape(org_##buffer##_shape__); });                           \
     buffer.updateShape(__VA_ARGS__);
 
-    preprocessLogits(inputs);
+    {
+        RTP_LLM_PROFILE_SCOPE("sampler.preprocess_logits");
+        preprocessLogits(inputs);
+    }
 
     uint64_t max_seq_len   = inputs.token_ids->shape()[1];
     auto     num_beams_in  = inputs.num_beams_in->data<uint64_t>();
@@ -63,6 +72,11 @@ SamplerOutput Sampler::forward(const SamplerInputs& inputs) {
         const auto beam_batch_size  = batch_size_in / cur_num_beams_in;
         const auto batch_size_out   = beam_batch_size * cur_num_beams_out;
         const auto to_batch_idx_out = from_batch_idx_out + batch_size_out;
+        RTP_LLM_PROFILE_SCOPE_DYNAMIC("sampler.group(type=%s,batch=%zu,beam_in=%zu,beam_out=%zu)",
+                                      cur_num_beams_in == 1 && cur_num_beams_out == 1 ? "greedy" : "beam",
+                                      beam_batch_size,
+                                      cur_num_beams_in,
+                                      cur_num_beams_out);
 
         auto success           = all_success->view(from_batch_idx_in, batch_size_in);
         auto logits            = inputs.logits->view(from_batch_idx_in, batch_size_in);
@@ -99,24 +113,29 @@ SamplerOutput Sampler::forward(const SamplerInputs& inputs) {
             auto do_sample = MAY_GET_BUFFER_VIEW(inputs.do_sample, from_batch_idx_in, batch_size_in);
             auto generator = std::vector<at::Generator>{inputs.generator.begin() + from_batch_idx_in,
                                                         inputs.generator.begin() + from_batch_idx_in + batch_size_in};
-            auto greedy_output =
-                device_->sampleGreedy({logits,
-                                       input_lengths,
-                                       sequence_lengths,
-                                       token_ids_in,
-                                       inputs.step,
-                                       top_k,
-                                       top_p,
-                                       temperature,
-                                       inputs.repetition_penalty ? (OptionalBufferRef)repetition_penalty : nullopt,
-                                       inputs.no_repeat_ngram_size ? (OptionalBufferRef)no_repeat_ngram_size : nullopt,
-                                       inputs.cum_log_probs ? (OptionalBufferRef)cum_log_probs_out : nullopt,
-                                       nullopt,  // output_log_probs
-                                       inputs.all_probs ? (OptionalBufferRef)all_probs : nullopt,
-                                       inputs.presence_penalty ? (OptionalBufferRef)presence_penalty : nullopt,
-                                       inputs.frequency_penalty ? (OptionalBufferRef)frequency_penalty : nullopt,
-                                       inputs.do_sample ? (OptionalBufferRef)do_sample : nullopt,
-                                       generator});
+            GreedyOutput greedy_output;
+            {
+                RTP_LLM_PROFILE_SCOPE_DYNAMIC(
+                    "sampler.greedy_search(batch=%zu,vocab=%zu)", batch_size_in, inputs.logits->shape()[1]);
+                greedy_output = device_->sampleGreedy(
+                    {logits,
+                     input_lengths,
+                     sequence_lengths,
+                     token_ids_in,
+                     inputs.step,
+                     top_k,
+                     top_p,
+                     temperature,
+                     inputs.repetition_penalty ? (OptionalBufferRef)repetition_penalty : nullopt,
+                     inputs.no_repeat_ngram_size ? (OptionalBufferRef)no_repeat_ngram_size : nullopt,
+                     inputs.cum_log_probs ? (OptionalBufferRef)cum_log_probs_out : nullopt,
+                     nullopt,  // output_log_probs
+                     inputs.all_probs ? (OptionalBufferRef)all_probs : nullopt,
+                     inputs.presence_penalty ? (OptionalBufferRef)presence_penalty : nullopt,
+                     inputs.frequency_penalty ? (OptionalBufferRef)frequency_penalty : nullopt,
+                     inputs.do_sample ? (OptionalBufferRef)do_sample : nullopt,
+                     generator});
+            }
             if (greedy_output.success) {
                 device_->copy({success, *greedy_output.success});
                 // TODO(zhangjianning.zjn): would be better to eliminate the copy
@@ -147,29 +166,48 @@ SamplerOutput Sampler::forward(const SamplerInputs& inputs) {
             SCOPED_UPDATE_BUFFER_SHAPE(cum_log_probs_out, {beam_batch_size, (size_t)cur_num_beams_out});
 
             // Model logits already reside on the device in the normal execution path. Avoid cloning the full
-            // [batch, beam, vocab] tensor here: beam search only reads logits, and log_softmax allocates its own
-            // output. Keep the clone as a fallback for callers that provide host logits.
+            // [batch, beam, vocab] tensor here. Keep the clone as a fallback for callers that provide host logits.
             BufferPtr logits_device =
                 logits.where() == MemoryType::MEMORY_GPU ? nullptr : device_->clone({logits, AllocationType::DEVICE});
             Buffer& beam_search_logits = logits_device ? *logits_device : logits;
 
-            auto token_ids_in_device     = device_->clone({token_ids_in, AllocationType::DEVICE});
-            auto input_lengths_device    = device_->clone({input_lengths, AllocationType::DEVICE});
-            auto sequence_lengths_device = device_->clone({sequence_lengths, AllocationType::DEVICE});
-            auto cum_log_probs_in_device = device_->clone({cum_log_probs_in, AllocationType::DEVICE});
+            BufferPtr token_ids_in_device;
+            BufferPtr input_lengths_device;
+            BufferPtr sequence_lengths_device;
+            BufferPtr cum_log_probs_in_device;
+            {
+                RTP_LLM_PROFILE_SCOPE_DYNAMIC(
+                    "sampler.beam_prepare_inputs(batch=%zu,beam=%zu)", beam_batch_size, cur_num_beams_in);
+                token_ids_in_device     = device_->clone({token_ids_in, AllocationType::DEVICE});
+                input_lengths_device    = device_->clone({input_lengths, AllocationType::DEVICE});
+                sequence_lengths_device = device_->clone({sequence_lengths, AllocationType::DEVICE});
+                cum_log_probs_in_device = device_->clone({cum_log_probs_in, AllocationType::DEVICE});
+            }
 
-            auto output = device_->sampleBeamSearch({beam_search_logits,
-                                                     token_ids_in_device,
-                                                     input_lengths_device,
-                                                     sequence_lengths_device,
-                                                     cum_log_probs_in_device,
-                                                     cur_num_beams_out,
-                                                     true,
-                                                     true});
+            BeamSearchOutput output;
+            {
+                RTP_LLM_PROFILE_SCOPE_DYNAMIC("sampler.beam_search(batch=%zu,beam_in=%zu,beam_out=%zu,vocab=%zu)",
+                                              beam_batch_size,
+                                              cur_num_beams_in,
+                                              cur_num_beams_out,
+                                              vocab_size);
+                output = device_->sampleBeamSearch({beam_search_logits,
+                                                    token_ids_in_device,
+                                                    input_lengths_device,
+                                                    sequence_lengths_device,
+                                                    cum_log_probs_in_device,
+                                                    cur_num_beams_out,
+                                                    true,
+                                                    true});
+            }
 
-            device_->copy({token_ids_out, *output.token_ids});
-            device_->copy({cum_log_probs_out, *output.cum_log_probs});
-            device_->copy({beam_indices, *output.beam_indices});
+            {
+                RTP_LLM_PROFILE_SCOPE_DYNAMIC(
+                    "sampler.beam_copy_outputs(batch=%zu,beam=%zu)", beam_batch_size, cur_num_beams_out);
+                device_->copy({token_ids_out, *output.token_ids});
+                device_->copy({cum_log_probs_out, *output.cum_log_probs});
+                device_->copy({beam_indices, *output.beam_indices});
+            }
 
             std::fill(success.data<bool>(), success.data<bool>() + batch_size_in, true);
         }
