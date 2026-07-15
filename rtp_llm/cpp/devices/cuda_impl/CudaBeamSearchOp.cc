@@ -58,8 +58,16 @@ BeamSearchOutput CudaDevice::sampleBeamSearch(const BeamSearchParams& params) {
     } while (0)
 
     // compute log softmax for probability calculation
-    at::Tensor logits_tsr             = Buffer2torchTensor(params.logits, false);
-    at::Tensor log_softmax_logits_tsr = logits_tsr.log_softmax(-1);
+    at::Tensor logits_tsr = Buffer2torchTensor(params.logits, false);
+    at::Tensor log_softmax_logits_tsr;
+    if (params.reuse_logits_buffer) {
+        // The sampler no longer needs the logits after beam search. Reuse that storage for log probabilities so
+        // log_softmax does not allocate another [batch, beam, vocab] tensor.
+        at::_log_softmax_out(logits_tsr, logits_tsr, -1, false);
+        log_softmax_logits_tsr = logits_tsr;
+    } else {
+        log_softmax_logits_tsr = logits_tsr.log_softmax(-1);
+    }
 
     // beam search heuristic
     tensorrt_llm::BeamSearchConfig config;
@@ -67,32 +75,113 @@ BeamSearchOutput CudaDevice::sampleBeamSearch(const BeamSearchParams& params) {
         config = tensorrt_llm::configureBeamSearch<T>(batch_size, beam_width_in, beam_width_out, vocab_size);
     });
 
-    // set beam search kernel workspace
-    BufferPtr workspace = allocateBuffer({DataType::TYPE_BYTES, {config.mWorkspaceSize}, AllocationType::DEVICE});
+    const size_t output_batch_size = static_cast<size_t>(batch_size) * beam_width_out;
+    const size_t token_ids_size    = output_batch_size * max_seq_len;
+
+    if (params.reuse_output_buffers) {
+        const auto tooSmall = [](const BufferPtr& buffer, DataType type, size_t size) {
+            return !buffer || buffer->type() != type || buffer->size() < size;
+        };
+        const bool should_grow =
+            tooSmall(beam_search_buffer_cache_.workspace, DataType::TYPE_BYTES, config.mWorkspaceSize)
+            || tooSmall(beam_search_buffer_cache_.token_ids, DataType::TYPE_INT32, token_ids_size)
+            || tooSmall(beam_search_buffer_cache_.beam_indices, DataType::TYPE_INT32, output_batch_size)
+            || tooSmall(beam_search_buffer_cache_.output_ids, DataType::TYPE_INT32, output_batch_size)
+            || tooSmall(beam_search_buffer_cache_.sequence_lengths, DataType::TYPE_INT32, output_batch_size)
+            || (config.mVBWS
+                && (tooSmall(beam_search_buffer_cache_.input_lengths, DataType::TYPE_INT32, output_batch_size)
+                    || tooSmall(beam_search_buffer_cache_.cum_log_probs, DataType::TYPE_FP32, output_batch_size)));
+        if (should_grow) {
+            // Release the previous cache as a unit before growing. This bounds retained memory to one beam-search
+            // configuration and avoids a transient peak containing both old and new workspaces.
+            beam_search_buffer_cache_ = {};
+        }
+    }
+
+    const auto cachedBufferView = [this](BufferPtr& cache, DataType type, size_t size, const char* tag) {
+        if (!cache || cache->type() != type || cache->size() < size) {
+            cache = allocateBuffer({type, {size}, AllocationType::DEVICE}, {tag});
+        }
+        return cache->slice(0, size);
+    };
+
+    BufferPtr workspace;
+    if (params.reuse_output_buffers) {
+        workspace = cachedBufferView(
+            beam_search_buffer_cache_.workspace, DataType::TYPE_BYTES, config.mWorkspaceSize, "beam_search_workspace");
+    } else {
+        workspace = allocateBuffer({DataType::TYPE_BYTES, {config.mWorkspaceSize}, AllocationType::DEVICE},
+                                   {"beam_search_workspace"});
+    }
     cudaMemsetAsync(workspace->data(), 0, workspace->sizeBytes(), stream_);
 
-    // allocate output buffer
-    auto token_ids_out = allocateBuffer({DataType::TYPE_INT32,
-                                         {(size_t)batch_size, (size_t)beam_width_out, (size_t)max_seq_len},
-                                         AllocationType::DEVICE},
-                                        {"token_ids_out"});
-    auto beam_indices  = allocateBuffer(
-        {DataType::TYPE_INT32, {(size_t)batch_size, (size_t)beam_width_out}, AllocationType::DEVICE}, {"beam_indices"});
-    auto output_ids = allocateBuffer(
-        {DataType::TYPE_INT32, {(size_t)batch_size, (size_t)beam_width_out}, AllocationType::DEVICE}, {"output_ids"});
-    BufferPtr input_lengths_out =
-        config.mVBWS ?
-            allocateBuffer({DataType::TYPE_INT32, {(size_t)batch_size, (size_t)beam_width_out}, AllocationType::DEVICE},
-                           {"input_length_out"}) :
-            params.input_lengths;
-    auto sequence_lengths_out =
-        allocateBuffer({DataType::TYPE_INT32, {(size_t)batch_size, (size_t)beam_width_out}, AllocationType::DEVICE},
-                       {"sequence_lengths_out"});
-    auto cum_log_probs_out =
-        config.mVBWS ?
-            allocateBuffer({DataType::TYPE_FP32, {(size_t)batch_size, (size_t)beam_width_out}, AllocationType::DEVICE},
-                           {"cum_log_probs_out"}) :
-            params.cum_log_probs;
+    BufferPtr token_ids_out;
+    BufferPtr beam_indices;
+    BufferPtr output_ids;
+    BufferPtr input_lengths_out;
+    BufferPtr sequence_lengths_out;
+    BufferPtr cum_log_probs_out;
+    if (params.reuse_output_buffers) {
+        token_ids_out = cachedBufferView(
+            beam_search_buffer_cache_.token_ids, DataType::TYPE_INT32, token_ids_size, "token_ids_out");
+        beam_indices = cachedBufferView(
+            beam_search_buffer_cache_.beam_indices, DataType::TYPE_INT32, output_batch_size, "beam_indices");
+        output_ids = cachedBufferView(
+            beam_search_buffer_cache_.output_ids, DataType::TYPE_INT32, output_batch_size, "output_ids");
+        sequence_lengths_out = cachedBufferView(beam_search_buffer_cache_.sequence_lengths,
+                                                DataType::TYPE_INT32,
+                                                output_batch_size,
+                                                "sequence_lengths_out");
+        if (config.mVBWS) {
+            input_lengths_out = cachedBufferView(
+                beam_search_buffer_cache_.input_lengths, DataType::TYPE_INT32, output_batch_size, "input_length_out");
+            cum_log_probs_out = cachedBufferView(
+                beam_search_buffer_cache_.cum_log_probs, DataType::TYPE_FP32, output_batch_size, "cum_log_probs_out");
+        } else {
+            input_lengths_out = params.input_lengths;
+            cum_log_probs_out = params.cum_log_probs;
+        }
+
+        token_ids_out->updateShape(
+            {static_cast<size_t>(batch_size), static_cast<size_t>(beam_width_out), static_cast<size_t>(max_seq_len)});
+        beam_indices->updateShape({static_cast<size_t>(batch_size), static_cast<size_t>(beam_width_out)});
+        output_ids->updateShape({static_cast<size_t>(batch_size), static_cast<size_t>(beam_width_out)});
+        sequence_lengths_out->updateShape({static_cast<size_t>(batch_size), static_cast<size_t>(beam_width_out)});
+        if (config.mVBWS) {
+            input_lengths_out->updateShape({static_cast<size_t>(batch_size), static_cast<size_t>(beam_width_out)});
+            cum_log_probs_out->updateShape({static_cast<size_t>(batch_size), static_cast<size_t>(beam_width_out)});
+        }
+    } else {
+        token_ids_out = allocateBuffer(
+            {DataType::TYPE_INT32,
+             {static_cast<size_t>(batch_size), static_cast<size_t>(beam_width_out), static_cast<size_t>(max_seq_len)},
+             AllocationType::DEVICE},
+            {"token_ids_out"});
+        beam_indices         = allocateBuffer({DataType::TYPE_INT32,
+                                               {static_cast<size_t>(batch_size), static_cast<size_t>(beam_width_out)},
+                                               AllocationType::DEVICE},
+                                              {"beam_indices"});
+        output_ids           = allocateBuffer({DataType::TYPE_INT32,
+                                               {static_cast<size_t>(batch_size), static_cast<size_t>(beam_width_out)},
+                                               AllocationType::DEVICE},
+                                              {"output_ids"});
+        input_lengths_out    = config.mVBWS ?
+                                   allocateBuffer({DataType::TYPE_INT32,
+                                                   {static_cast<size_t>(batch_size), static_cast<size_t>(beam_width_out)},
+                                                   AllocationType::DEVICE},
+                                                  {"input_length_out"}) :
+                                   params.input_lengths;
+        sequence_lengths_out = allocateBuffer({DataType::TYPE_INT32,
+                                               {static_cast<size_t>(batch_size), static_cast<size_t>(beam_width_out)},
+                                               AllocationType::DEVICE},
+                                              {"sequence_lengths_out"});
+        cum_log_probs_out    = config.mVBWS ?
+                                   allocateBuffer({DataType::TYPE_FP32,
+                                                   {static_cast<size_t>(batch_size), static_cast<size_t>(beam_width_out)},
+                                                   AllocationType::DEVICE},
+                                                  {"cum_log_probs_out"}) :
+                                   params.cum_log_probs;
+    }
 
     // set BeamHypotheses
     tensorrt_llm::kernels::BeamHypotheses BH;

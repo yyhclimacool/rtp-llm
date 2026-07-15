@@ -942,7 +942,10 @@ struct BeamSearchParams {
     BufferPtr     input_lengths;     // [batch_size, num_beams_in]
     BufferPtr     sequence_lengths;  // [batch_size, num_beams_in]
     BufferPtr     cum_log_probs;     // [batch_size, num_beams_in]
-    size_t        num_beams_out = 0;
+    size_t        num_beams_out       = 0;
+    bool          reuse_logits_buffer = false;
+    // Reused outputs are transient and remain valid only until the next reuse-enabled beam-search call.
+    bool reuse_output_buffers = false;
 };
 
 struct BeamSearchOutput {

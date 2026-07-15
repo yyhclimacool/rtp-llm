@@ -30,6 +30,16 @@ nvinfer1::DataType nvinfer1DtypeConvert(rtp_llm::DataType dtype);
 
 class CudaGemmArguments;
 
+struct BeamSearchBufferCache {
+    BufferPtr workspace;
+    BufferPtr token_ids;
+    BufferPtr beam_indices;
+    BufferPtr output_ids;
+    BufferPtr input_lengths;
+    BufferPtr sequence_lengths;
+    BufferPtr cum_log_probs;
+};
+
 class CudaEvent: public DeviceEvent {
 public:
     CudaEvent(cudaStream_t stream);
@@ -285,6 +295,7 @@ private:
     std::unique_ptr<IAllocator>                                     host_allocator_;
     c10::cuda::CUDACachingAllocator::CUDAAllocator*                 origin_torch_cuda_allocator_;
     std::unique_ptr<c10::cuda::CUDACachingAllocator::CUDAAllocator> managed_torch_cuda_allocator_;
+    BeamSearchBufferCache                                           beam_search_buffer_cache_;
 
     cublasHandle_t   cublas_handle_;
     cublasLtHandle_t cublaslt_handle_;

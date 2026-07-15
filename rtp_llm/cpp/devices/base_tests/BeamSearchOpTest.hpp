@@ -77,7 +77,7 @@ public:
         auto cum_log_probs    = tensorToBuffer(input.cum_log_probs, AllocationType::DEVICE);
 
         auto output = device_->sampleBeamSearch(
-            {*logits, token_ids, input_lengths, sequence_lengths, cum_log_probs, (size_t)input.beam_width_out});
+            {*logits, token_ids, input_lengths, sequence_lengths, cum_log_probs, (size_t)input.beam_width_out, true});
 
         return TestBeamSearchOutput({bufferToTensor(*output.token_ids),
                                      bufferToTensor(*output.input_lengths),
