@@ -32,10 +32,17 @@ public:
     TorchProfile& operator=(const TorchProfile&) = delete;
 
 private:
-    std::string                 prefix_;
-    std::string                 output_dir_;
-    static std::atomic<size_t>  count_;
-    tpi::ProfilerConfig         config_ = tpi::ProfilerConfig(tpi::ProfilerState::KINETO, /*report_input_shapes=*/true);
+    std::string                prefix_;
+    std::string                output_dir_;
+    static std::atomic<size_t> count_;
+    // Profiling is explicitly requested and short-lived, so favor diagnostic detail over collection overhead:
+    // record tensor shapes, allocation/free events, source stacks, and FLOP estimates.
+    tpi::ProfilerConfig         config_ = tpi::ProfilerConfig(tpi::ProfilerState::KINETO,
+                                                      /*report_input_shapes=*/true,
+                                                      /*profile_memory=*/true,
+                                                      /*with_stack=*/true,
+                                                      /*with_flops=*/true,
+                                                      /*with_modules=*/false);
     std::set<tpi::ActivityType> activities_{tpi::ActivityType::CPU, tpi::ActivityType::CUDA};
     bool                        stopped_ = true;
 };

@@ -84,11 +84,6 @@ CudaDevice::prepareTrtAttn(const AttentionConfigs& configs, const BufferPtr& kv_
                                         batch_size,
                                         max_blocks_per_batch,
                                         run_stream);
-    if (is_sm90() && fmha_type_ == FMHAType::PAGED_TRT_V2) {
-        trt_attn->kv_cache_offset_h                        = trt_attn->kv_cache_offset.to(torch::kCPU);
-        trt_attn->kv_block_array.pagedKVBlockOffsetsOnHost = trt_attn->kv_cache_offset_h.data_ptr();
-    }
-
     check_cuda_error();
     return trt_attn;
 }
@@ -262,8 +257,13 @@ void selfAttentionwrapper(const AttentionModuleParams params,
                           KVBlockArray                kv_block_array,
                           cudaStream_t                stream,
                           CudaDevice*                 device) {
-    size_t      batch_size        = params.common.decoder_batch_size;
-    size_t      step              = params.common.decoder_max_seq_len + 1;
+    size_t batch_size = params.common.decoder_batch_size;
+    // During native cuda graph capture the graph freezes host-side scalars, so decoder_max_seq_len
+    // (which changes every decode step) cannot be baked into the captured kernel. Use the static
+    // upper bound instead; per-request real length still comes from the device sequence_lengths
+    // pointer, so correctness is preserved. Mirrors the ROCm aiterPA capture-aware branch.
+    size_t      step = device->nativeGraphCapturing() ? static_cast<size_t>(device->initParams().max_seq_len) :
+                                                        params.common.decoder_max_seq_len + 1;
     size_t      local_head_num    = params.configs.head_num;
     size_t      local_head_num_kv = params.configs.kv_head_num;
     size_t      size_per_head     = params.configs.size_per_head;
@@ -434,7 +434,8 @@ AttentionModuleOutput CudaDevice::decoderSelfAttention(const AttentionModulePara
                size_per_head,
                params.common.decoder_batch_size,
                static_cast<size_t>(kv_block_array.mMaxBlocksPerSeq),
-               params.common.decoder_max_seq_len + 1,
+               nativeGraphCapturing() ? static_cast<size_t>(init_params_.max_seq_len) :
+                                        params.common.decoder_max_seq_len + 1,
                local_tokens_per_block,
                kv_block_array.mPrimaryPoolPtr,
                reinterpret_cast<int32_t*>(const_cast<KVCacheIndex*>(kv_block_array.data)),

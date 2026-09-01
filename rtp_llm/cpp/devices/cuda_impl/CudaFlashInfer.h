@@ -16,6 +16,7 @@ private:
 
     BufferPtr buf_h;
     BufferPtr buf_d;
+    BufferPtr sequence_lengths_d_buffer;
 
 public:
     int batch_size      = 0;
@@ -87,7 +88,8 @@ private:
     static std::tuple<BufferPtr, std::vector<torch::Tensor>>
     allocateManyBuffer(CudaDevice* device, const std::vector<std::vector<int64_t>>& shapes, AllocationType atype);
 
-    static FlashInferAttnParams* create(CudaDevice* device, int batch_size, int token_num, int page_num);
+    static FlashInferAttnParams*
+    create(CudaDevice* device, int batch_size, int token_num, int page_num, bool is_prefill);
 
     void genPlan(int     batch_size,
                  int     q_length,
@@ -118,7 +120,12 @@ public:
                                                 const int        batch_size,
                                                 const int        tokens_per_block);
     void                         refreshFlashInferBuf(CudaDevice* device, int batch_size, int token_num);
-    static FlashInferAttnParams* get(int batch_size, int input_token_num);
+    void                         prepareDecodeForNativeGraph(CudaDevice*      device,
+                                                             const BufferPtr& sequence_lengths_host,
+                                                             const BufferPtr& kv_cache_block_id_device,
+                                                             int              batch_size,
+                                                             int              tokens_per_block);
+    static FlashInferAttnParams* get(int batch_size, int input_token_num, bool is_prefill);
 };
 
 using FlashInferAttnParamsPtr = std::shared_ptr<FlashInferAttnParams>;
@@ -127,5 +134,9 @@ struct ParamsCache {
     // use inline to make sure the static params unique globally.
     static inline std::deque<FlashInferAttnParams*> DECODE_PARAMS_CACHE;
     static inline std::deque<FlashInferAttnParams*> PREFILL_PARAMS_CACHE;
+    // Native graph captures a second forward while the eager output is still alive,
+    // so the capture params cannot rely on recycling the eager params object. The
+    // graph-enabled decode plan itself is immutable and can be shared.
+    static inline std::deque<torch::Tensor> NATIVE_DECODE_PLANS;
 };
 }  // namespace rtp_llm

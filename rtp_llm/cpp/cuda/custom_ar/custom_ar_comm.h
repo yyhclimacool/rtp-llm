@@ -47,6 +47,13 @@ public:
 
     bool checkAllReduceAvailable(size_t elts_total_num, DataType data_type, size_t world_size);
 
+    // Register buffers used inside a captured CUDA graph. The custom all-reduce comm buffers are
+    // allocated once via cudaMalloc and shared through fixed cudaIpc handles, and prepareAllReduce
+    // always hands back the same peer_comm_buffer_ptr, so the pointers baked into a captured graph
+    // stay valid across replays and no per-graph re-registration is required. Kept for parity with
+    // the ROCm path (aiter::register_graph_buffers) and as an extension point.
+    void registerGraphBuffers();
+
     static bool
     shouldCustomAR(const std::vector<size_t>& tp_ranks, size_t rank, const HWKernelConfig& hw_kernel_config);
 

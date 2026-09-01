@@ -36,6 +36,23 @@ void invokeConvertOffsetToBlockArrayData(int32_t*     offset_addr,  // [b, 2, m]
                                          int          max_block_num,
                                          cudaStream_t stream);
 
+// Build FlashInfer decode metadata from device-side dynamic inputs. The output
+// buffers are statically sized; page_indptr identifies the valid compact range
+// in page_indices for each sequence.
+void invokePrepareFlashInferDecodeMetadata(int32_t*       page_indptr,
+                                           int32_t*       qo_indptr,
+                                           int32_t*       batch_indices,
+                                           int32_t*       positions,
+                                           int32_t*       kv_lens,
+                                           int32_t*       paged_kv_last_page_len,
+                                           int32_t*       page_indices,
+                                           const int32_t* sequence_lengths,
+                                           const int32_t* kv_cache_block_ids,
+                                           int            batch_size,
+                                           int            max_blocks_per_batch,
+                                           int            tokens_per_block,
+                                           cudaStream_t   stream);
+
 // Reuse KV cache indexed batched kernel
 template<typename T>
 void invokeReuseKVCacheIndexedBatched(

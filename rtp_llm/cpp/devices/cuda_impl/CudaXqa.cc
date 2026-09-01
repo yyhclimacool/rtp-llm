@@ -4,6 +4,7 @@
 #include "rtp_llm/cpp/utils/math_utils.h"
 #include <torch/torch.h>
 #include <c10/cuda/CUDAStream.h>
+#include <mutex>
 
 using namespace std;
 using namespace rtp_llm;
@@ -91,6 +92,44 @@ torch::Tensor getSpecQMask(size_t max_q_len, size_t max_batch_size) {
 }
 
 static std::once_flag xqa_info_flag;
+
+struct XqaResources {
+    torch::Tensor kv_cache_scale;
+    torch::Tensor semaphores;
+    torch::Tensor q_mask;
+    void*         scratch        = nullptr;
+    size_t        kv_head_num    = 0;
+    size_t        group_size     = 0;
+    size_t        max_q_len      = 0;
+    size_t        max_batch_size = 0;
+    uint32_t      beam_width     = 0;
+};
+
+static XqaResources&
+getXqaResources(size_t kv_head_num, size_t group_size, size_t max_q_len, size_t max_batch_size, uint32_t beam_width) {
+    static std::mutex                    mutex;
+    static std::unique_ptr<XqaResources> resources;
+    std::lock_guard<std::mutex>          lock(mutex);
+    if (!resources) {
+        RTP_LLM_CHECK_WITH_INFO(!CaptureCheck::in_cuda_graph_capture,
+                                "XQA resources must be initialized by the eager run before CUDA graph capture");
+        resources                 = std::make_unique<XqaResources>();
+        resources->kv_cache_scale = getKVCacheScale();
+        resources->semaphores     = getSemaphores(kv_head_num, group_size, max_q_len, max_batch_size);
+        resources->scratch        = getScratch(group_size, beam_width);
+        resources->q_mask         = getSpecQMask(max_q_len, max_batch_size);
+        resources->kv_head_num    = kv_head_num;
+        resources->group_size     = group_size;
+        resources->max_q_len      = max_q_len;
+        resources->max_batch_size = max_batch_size;
+        resources->beam_width     = beam_width;
+    }
+    RTP_LLM_CHECK_WITH_INFO(resources->kv_head_num == kv_head_num && resources->group_size == group_size
+                                && resources->max_q_len >= max_q_len && resources->max_batch_size >= max_batch_size
+                                && resources->beam_width == beam_width,
+                            "XQA resource configuration changed after initialization");
+    return *resources;
+}
 
 bool supportXqa(DataType input_type,
                 DataType output_type,
@@ -181,18 +220,13 @@ void runXqa(void*     input,
 
     size_t max_seq_len_round = round_up<size_t>(max_seq_len, page_size);
 
-    static torch::Tensor kv_cache_scale = getKVCacheScale();
-
-    static torch::Tensor semaphores = getSemaphores(kv_head_num, group_size, max_q_len, max_batch_size);
-
-    static void* scratch = getScratch(group_size, beam_width);
-
-    static torch::Tensor q_mask = getSpecQMask(max_q_len, max_batch_size);
+    auto& resources = getXqaResources(kv_head_num, group_size, max_q_len, max_batch_size, beam_width);
 
     static auto device_prop = getDeviceProp();
 
-    SpecDecParams spec_params{
-        static_cast<uint32_t>(max_q_len), reinterpret_cast<uint32_t*>(q_cu_seqlens), q_mask.data_ptr<uint32_t>()};
+    SpecDecParams spec_params{static_cast<uint32_t>(max_q_len),
+                              reinterpret_cast<uint32_t*>(q_cu_seqlens),
+                              resources.q_mask.data_ptr<uint32_t>()};
 
     run_xqa_sm90(static_cast<uint32_t>(head_dim),
                  static_cast<uint32_t>(page_size),
@@ -209,9 +243,9 @@ void runXqa(void*     input,
                  static_cast<uint32_t>(max_seq_len_round),
                  sequence_lengths,
                  static_cast<uint32_t>(batch_size),
-                 kv_cache_scale.data_ptr<float>(),
-                 semaphores.data_ptr<uint32_t>(),
-                 scratch,
+                 resources.kv_cache_scale.data_ptr<float>(),
+                 resources.semaphores.data_ptr<uint32_t>(),
+                 resources.scratch,
                  getCurrentStream(),
                  input,
                  rcp_out_scale,

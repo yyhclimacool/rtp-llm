@@ -64,6 +64,7 @@ struct BatchStateHash {
 
 class ExecutorBase {
 public:
+    virtual ~ExecutorBase()     = default;
     virtual void replay()       = 0;
     virtual void captureBegin() = 0;
     virtual void captureEnd()   = 0;

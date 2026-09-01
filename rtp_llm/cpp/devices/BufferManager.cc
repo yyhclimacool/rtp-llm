@@ -1,6 +1,7 @@
 #include "rtp_llm/cpp/devices/BufferManager.h"
 #include "rtp_llm/cpp/core/TrackerAllocator.h"
 #include "rtp_llm/cpp/utils/StackTrace.h"
+#include "rtp_llm/cpp/utils/ProfilingScope.h"
 #include "autil/StackTracer.h"
 
 #include <numeric>
@@ -35,6 +36,11 @@ BufferManager::BufferManager(IAllocator*                        device_allocator
 BufferManager::~BufferManager() {}
 
 BufferPtr BufferManager::allocate(const BufferParams& params, const BufferHints& hints) {
+    RTP_LLM_PROFILE_SCOPE_DYNAMIC("memory.buffer_allocate(bytes=%zu,location=%d,private=%d,tag=%s)",
+                                  params.sizeInBytes(),
+                                  static_cast<int>(params.allocation),
+                                  static_cast<int>(params.private_alloc),
+                                  hints.tag.c_str());
     try {
         auto buffer = doAllocate(params, hints);
         recordAllcation(params, hints, buffer);
@@ -51,6 +57,8 @@ BufferPtr BufferManager::allocate(const BufferParams& params, const BufferHints&
 }
 
 void BufferManager::recycle(Buffer* buffer, IAllocator* allocator) {
+    RTP_LLM_PROFILE_SCOPE_DYNAMIC(
+        "memory.buffer_recycle(bytes=%zu,location=%d)", buffer->sizeBytes(), static_cast<int>(buffer->where()));
     auto data = buffer->data();
 
     if (recycle_held_) {
