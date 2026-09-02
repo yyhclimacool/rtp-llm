@@ -60,8 +60,8 @@ protected:
     cublasAlgoMap* cublas_algo_map_;
     std::mutex*    mutex_;
 
-    IAllocator*                        allocator_        = nullptr;
-    void*                              cublas_workspace_ = nullptr;
+    IAllocator*                        allocator_          = nullptr;
+    void*                              cublas_workspace_   = nullptr;
     bool                               deterministic_gemm_ = false;
     std::vector<void*>                 additional_cublas_workspaces_;
     std::unordered_map<void*, int32_t> cublas_workspces_map_;
@@ -160,11 +160,11 @@ public:
     // Selects the first heuristic candidate with splitK<=1 to guarantee deterministic
     // results. Aborts if no such candidate exists among the top-64 candidates.
     std::pair<bool, cublasLtMatmulAlgo_t> findDeterministicAlgo(cublasLtHandle_t       lightHandle,
-                                                                 cublasLtMatmulDesc_t   computeDesc,
-                                                                 cublasLtMatrixLayout_t Adesc,
-                                                                 cublasLtMatrixLayout_t Bdesc,
-                                                                 cublasLtMatrixLayout_t Cdesc,
-                                                                 cublasLtMatrixLayout_t Ddesc);
+                                                                cublasLtMatmulDesc_t   computeDesc,
+                                                                cublasLtMatrixLayout_t Adesc,
+                                                                cublasLtMatrixLayout_t Bdesc,
+                                                                cublasLtMatrixLayout_t Cdesc,
+                                                                cublasLtMatrixLayout_t Ddesc);
 
     std::pair<bool, cublasLtMatmulAlgo_t> findBestAlgo(cublasLtHandle_t       lightHandle,
                                                        cublasLtMatmulDesc_t   computeDesc,
@@ -181,10 +181,28 @@ public:
                                                        cudaStream_t           stream);
 
     using MatrixLayout = std::tuple<cudaDataType_t, cublasLtOrder_t, uint64_t, uint64_t>;
-    using cache_idx_t  = std::tuple<cublasLtMatmulDesc_t, std::array<MatrixLayout, 4>>;
+    // Value snapshot of the cublasLtMatmulDesc attributes that influence algorithm selection.
+    // The desc handle itself is created and destroyed on every GEMM call, so it must never be
+    // used as a cache key: the pointer differs per call, lookups never hit and the map grows
+    // without bound. Pointer-typed attributes are reduced to their alignment class, which is
+    // what cublasLtMatmulAlgoGetHeuristic actually depends on.
+    using MatmulDescKey = std::tuple<int32_t,    // compute type
+                                     int32_t,    // scale type
+                                     int32_t,    // pointer mode
+                                     int32_t,    // transa
+                                     int32_t,    // transb
+                                     int32_t,    // transc
+                                     uint32_t,   // epilogue
+                                     int32_t,    // sm count target
+                                     int8_t,     // fast accum
+                                     uint32_t,   // A scale pointer alignment (0 = unset)
+                                     uint32_t,   // B scale pointer alignment (0 = unset)
+                                     uint32_t>;  // bias pointer alignment (0 = unset)
+    using cache_idx_t   = std::tuple<MatmulDescKey, std::array<MatrixLayout, 4>>;
     std::map<cache_idx_t, cublasLtMatmulAlgo_t> algo_cache;
 
-    MatrixLayout createMatrixLayout(cublasLtMatrixLayout_t Mdesc);
+    MatrixLayout  createMatrixLayout(cublasLtMatrixLayout_t Mdesc);
+    MatmulDescKey createMatmulDescKey(cublasLtMatmulDesc_t desc);
 
     void Gemm(cublasOperation_t transa,
               cublasOperation_t transb,
