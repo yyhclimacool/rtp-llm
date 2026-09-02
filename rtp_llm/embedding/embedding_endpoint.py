@@ -13,6 +13,7 @@ from rtp_llm.async_decoder_engine.embedding.interface import EngineInputs, Engin
 from rtp_llm.config.exceptions import ExceptionType, FtRuntimeException
 from rtp_llm.frontend.tokenizer_factory.tokenizers import BaseTokenizer
 from rtp_llm.models.downstream_modules.utils import create_custom_module
+from rtp_llm.utils.grpc_host_channel_pool import GrpcHostChannelPool
 
 
 def tensor_pb_to_torch(tensor_pb) -> Optional[torch.Tensor]:
@@ -62,6 +63,14 @@ class EmbeddingEndpoint(object):
             for key, value in client_config.items():
                 self.options.append((key, value))
         logging.info(f"embedding endpoint grpc options: {self.options}")
+        # Reuse channels across requests: creating a new aio channel per request
+        # leaks C-core resources over time and causes RSS growth.
+        self._channel_pool = GrpcHostChannelPool(
+            options=self.options, cleanup_interval=60
+        )
+
+    async def close(self) -> None:
+        await self._channel_pool.close()
 
     async def embedding(
         self, request: Dict[str, Any]
@@ -91,7 +100,7 @@ class EmbeddingEndpoint(object):
     async def generate_embeddings_grpc(
         self, input: EngineInputs, output: EngineOutputs
     ):
-        channel = grpc.aio.insecure_channel(self.address, options=self.options)
+        channel = await self._channel_pool.get(self.address)
         stub = pb2_grpc.EmbeddingRpcServiceStub(channel)
         multimodal_features = []
         for feature in input.multimodal_inputs:
@@ -126,5 +135,3 @@ class EmbeddingEndpoint(object):
         except grpc.RpcError as e:
             logging.warning(f"RPC failed: {e.code()}: {e.details()}")
             raise
-        finally:
-            await channel.close()
