@@ -15,7 +15,7 @@ index 1d30d9e..e271ddd 100644
  #include "flash.h"
  #include "flash_fwd_kernel.h"
 
-+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && (__CUDA_ARCH__ < 900)
++#if defined(__CUDA_ARCH__) && (((__CUDA_ARCH__ >= 800) && (__CUDA_ARCH__ < 900)) || ((__CUDA_ARCH__ >= 1200) && (__CUDA_ARCH__ < 1300)))
  template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Return_softmax>
  __global__ void flash_fwd_kernel(__grid_constant__ const Flash_fwd_params params) {
      static_assert(!(Is_causal && Is_local));  // If Is_local is true, Is_causal should be false

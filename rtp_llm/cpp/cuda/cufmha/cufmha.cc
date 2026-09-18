@@ -8,23 +8,23 @@ using namespace tensorrt_llm::kernels;
 
 namespace rtp_llm {
 
-cufmha::cufmha(DataType          dtype,
-               bool     is_causal,
-               size_t            head_num,
-               size_t            kv_head_num,
-               size_t            size_per_head,
-               size_t            seq_size_per_block,
-               float             q_scaling,
-               bool              use_linear_bias_slopes,
-               bool              can_use_trtv1_fmha,
-               bool              can_use_trtv2_fmha,
-               bool              can_use_trtv2_fmha_paged,
-               bool              can_use_open_source_fmha,
-               bool              can_use_open_source_fmha_paged,
-               bool              is_s_padded,
-               cudaStream_t      stream) {
-    dtype_      = dtype;
-    is_causal_  = is_causal;
+cufmha::cufmha(DataType     dtype,
+               bool         is_causal,
+               size_t       head_num,
+               size_t       kv_head_num,
+               size_t       size_per_head,
+               size_t       seq_size_per_block,
+               float        q_scaling,
+               bool         use_linear_bias_slopes,
+               bool         can_use_trtv1_fmha,
+               bool         can_use_trtv2_fmha,
+               bool         can_use_trtv2_fmha_paged,
+               bool         can_use_open_source_fmha,
+               bool         can_use_open_source_fmha_paged,
+               bool         is_s_padded,
+               cudaStream_t stream) {
+    dtype_         = dtype;
+    is_causal_     = is_causal;
     head_num_      = head_num;
     kv_head_num_   = kv_head_num;
     size_per_head_ = size_per_head;
@@ -37,7 +37,7 @@ cufmha::cufmha(DataType          dtype,
     support_trt_v1_fmha_    = can_use_trtv1_fmha && initTrtV1FmhaAndCheckSupport();
     // sm 90 use open source has bug currently
     support_open_source_fmha_ = (can_use_open_source_fmha || can_use_open_source_fmha_paged)
-                                && initOpenSourceFmhaAndCheckSupport() && get_sm() < 90;
+                                && initOpenSourceFmhaAndCheckSupport() && (get_sm() < 90 || is_sm12x());
     stream_ = stream;
 
     support_trt_v2_fmha_       = false;

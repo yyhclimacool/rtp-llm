@@ -38,12 +38,12 @@ index e271ddd..30d6055 100644
 +        FA_CUDA_CHECK(cudaGetDevice(&device));
 +        cudaDeviceProp deviceProp;
 +        FA_CUDA_CHECK(cudaGetDeviceProperties(&deviceProp, device));
-+        return deviceProp.major == 8 && deviceProp.minor > 0;
++        return (deviceProp.major == 8 && deviceProp.minor > 0) || deviceProp.major == 12;
 +    }();
 +    return IS_SM8X;
 +}
 +
- #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && (__CUDA_ARCH__ < 900)
+ #if defined(__CUDA_ARCH__) && (((__CUDA_ARCH__ >= 800) && (__CUDA_ARCH__ < 900)) || ((__CUDA_ARCH__ >= 1200) && (__CUDA_ARCH__ < 1300)))
  template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Return_softmax>
  __global__ void flash_fwd_kernel(__grid_constant__ const Flash_fwd_params params) {
 @@ -70,15 +90,15 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {

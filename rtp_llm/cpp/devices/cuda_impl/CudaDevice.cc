@@ -503,6 +503,8 @@ DevicePrepOutput CudaDevice::prepareModelRun(const DevicePrepParams& params) {
             } else if (use_open_source_fmha_paged && cufmha_runner_->openSourceFmhaSupport()
                        && params.configs.kernel_tokens_per_block % 256 == 0) {
                 fmha_type_ = FMHAType::PAGED_OPEN_SOURCE;
+            } else if (output.prefill_flash_infer_attn != nullptr) {
+                fmha_type_ = FMHAType::FLASH_INFER;
             }
         } else if (!params.diff_qkv_len) {
             if (!deterministic_attn && use_trtv2_fmha && cufmha_runner_->trtV2FmhaSupport()) {
@@ -511,6 +513,8 @@ DevicePrepOutput CudaDevice::prepareModelRun(const DevicePrepParams& params) {
                 fmha_type_ = FMHAType::OPEN_SOURCE;
             } else if (use_trtv1_fmha && cufmha_runner_->trtV1FmhaSupport() && mla_ops_type == MlaOpsType::MHA) {
                 fmha_type_ = FMHAType::TRT_V1;
+            } else if (output.prefill_flash_infer_attn != nullptr) {
+                fmha_type_ = FMHAType::FLASH_INFER;
             }
         } else {
             fmha_type_ = FMHAType::NONE;
@@ -600,7 +604,7 @@ void CudaDevice::bufMemset(Buffer& buf, int val, DeviceStream stream) {
 }
 
 void CudaDevice::checkUseOpenSourceFMHA() {
-    if (!(is_sm8x() || is_sm90())) {
+    if (!(is_sm8x() || is_sm90() || is_sm12x())) {
         RTP_LLM_LOG_WARNING("opensource FMHA is disabled for sm %d", get_sm());
         return;
     }

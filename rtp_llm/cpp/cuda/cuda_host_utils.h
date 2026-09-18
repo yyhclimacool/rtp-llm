@@ -41,6 +41,7 @@ bool is_sm70();
 bool is_sm8x();
 bool is_sm90();
 bool is_sm100();
+bool is_sm12x();
 
 float                      timing_function(const std::function<void(cudaStream_t)>& operation,
                                            int64_t                                  timing_iterations,
